@@ -8,14 +8,17 @@ usage() {
 Usage: ./collect.sh [options]
 
 Required options:
-  --ck-user USER                     ClickHouse user (or set CK_USER)
-  --ck-password PASSWORD             ClickHouse password (or set CK_PASSWORD)
   --business-time-config PATH        Business table time column config file (YAML/JSON)
 
 Optional options:
+  --ck-user USER                     ClickHouse user (default "root" or CK_USER)
+  --ck-password PASSWORD             ClickHouse password (or set CK_PASSWORD; default from k8s secret root)
   --ck-database-business NAME        Business database name (default "business" or CK_DATABASE_BUSINESS)
   --bucket-interval-minutes MINS     Bucket interval for time series stats (default 30 or BUCKET_INTERVAL_MINUTES)
   --resource-history-days DAYS       Lookback window for node metrics and query_log stats (default 180 or RESOURCE_HISTORY_DAYS)
+  --query-time-range-days DAYS       Lookback window for time range stats (default 30 or QUERY_TIME_RANGE_DAYS)
+  --query-time-range-max-threads N   max_threads for time range query (default 2 or QUERY_TIME_RANGE_MAX_THREADS)
+  --query-time-range-max-seconds N   max_execution_time seconds (default 300 or QUERY_TIME_RANGE_MAX_SECONDS)
   --ck-k8s-namespace NAME            Kubernetes namespace containing the ClickHouse pod (ck or set CK_K8S_NAMESPACE)
   --ck-k8s-pod POD                   ClickHouse pod name to exec into (ck or set CK_K8S_POD)
   --ck-cluster-name NAME             ClickHouse cluster name for clusterAllReplicas queries
@@ -53,6 +56,14 @@ require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     >&2 echo "ERROR: missing required command: $1"
     exit 1
+  fi
+}
+
+base64_decode() {
+  if base64 -d >/dev/null 2>&1 </dev/null; then
+    base64 -d
+  else
+    base64 -D
   fi
 }
 
@@ -95,6 +106,9 @@ CK_PASSWORD="${CK_PASSWORD:-}"
 CK_DATABASE_BUSINESS="${CK_DATABASE_BUSINESS:-business}"
 BUCKET_INTERVAL_MINUTES="${BUCKET_INTERVAL_MINUTES:-30}"
 RESOURCE_HISTORY_DAYS="${RESOURCE_HISTORY_DAYS:-180}"
+QUERY_TIME_RANGE_DAYS="${QUERY_TIME_RANGE_DAYS:-30}"
+QUERY_TIME_RANGE_MAX_THREADS="${QUERY_TIME_RANGE_MAX_THREADS:-2}"
+QUERY_TIME_RANGE_MAX_SECONDS="${QUERY_TIME_RANGE_MAX_SECONDS:-300}"
 COMPRESS_OUTPUT="${COMPRESS_OUTPUT:-true}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 BUSINESS_TIME_CONFIG="${BUSINESS_TIME_CONFIG:-}"
@@ -130,6 +144,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --resource-history-days)
       RESOURCE_HISTORY_DAYS="$2"
+      shift 2
+      ;;
+    --query-time-range-days)
+      QUERY_TIME_RANGE_DAYS="$2"
+      shift 2
+      ;;
+    --query-time-range-max-threads)
+      QUERY_TIME_RANGE_MAX_THREADS="$2"
+      shift 2
+      ;;
+    --query-time-range-max-seconds)
+      QUERY_TIME_RANGE_MAX_SECONDS="$2"
       shift 2
       ;;
     --compress-output)
@@ -200,14 +226,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$CK_USER" ]]; then
-  >&2 echo "ERROR: --ck-user or CK_USER is required"
-  exit 1
-fi
-if [[ -z "$CK_PASSWORD" ]]; then
-  >&2 echo "ERROR: --ck-password or CK_PASSWORD is required"
-  exit 1
-fi
 if [[ -z "$BUSINESS_TIME_CONFIG" ]]; then
   >&2 echo "ERROR: --business-time-config or BUSINESS_TIME_CONFIG is required"
   exit 1
@@ -246,12 +264,22 @@ require_cmd sort
 require_cmd head
 require_cmd tail
 require_cmd cut
-
-VM_ENABLED="true"
-VM_BASE_URL_TRIMMED="${VM_BASE_URL%/}"
-if ! curl -sS --fail --get --data-urlencode "query=1" "${VM_BASE_URL_TRIMMED}/api/v1/query" >/dev/null 2>&1; then
-  log "WARNING: VictoriaMetrics is not reachable at $VM_BASE_URL. Skipping VM-based collectors."
-  VM_ENABLED="false"
+if [[ -z "$CK_USER" ]]; then
+  CK_USER="root"
+fi
+if [[ -z "$CK_PASSWORD" ]]; then
+  require_cmd jq
+  require_cmd base64
+  CK_PASSWORD=$(
+    kubectl -n "$CK_K8S_NAMESPACE" get secret root -ojson 2>/dev/null \
+      | jq -r .data.root 2>/dev/null \
+      | base64_decode 2>/dev/null \
+      | tr -d '\r' || true
+  )
+fi
+if [[ -z "$CK_PASSWORD" ]]; then
+  >&2 echo "ERROR: missing ClickHouse password. Set --ck-password/CK_PASSWORD or ensure 'kubectl -n ${CK_K8S_NAMESPACE} get secret root -ojson | jq -r .data.root | base64 -d' works."
+  exit 1
 fi
 
 if ! [[ "$BUCKET_INTERVAL_MINUTES" =~ ^[0-9]+$ ]]; then
@@ -260,6 +288,18 @@ if ! [[ "$BUCKET_INTERVAL_MINUTES" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "$RESOURCE_HISTORY_DAYS" =~ ^[0-9]+$ ]]; then
   >&2 echo "ERROR: --resource-history-days must be an integer"
+  exit 1
+fi
+if ! [[ "$QUERY_TIME_RANGE_DAYS" =~ ^[0-9]+$ ]]; then
+  >&2 echo "ERROR: --query-time-range-days must be an integer"
+  exit 1
+fi
+if ! [[ "$QUERY_TIME_RANGE_MAX_THREADS" =~ ^[0-9]+$ ]]; then
+  >&2 echo "ERROR: --query-time-range-max-threads must be an integer"
+  exit 1
+fi
+if ! [[ "$QUERY_TIME_RANGE_MAX_SECONDS" =~ ^[0-9]+$ ]]; then
+  >&2 echo "ERROR: --query-time-range-max-seconds must be an integer"
   exit 1
 fi
 if [[ -z "$OUTPUT_DIR" ]]; then
@@ -276,8 +316,14 @@ mkdir -p "$BUSINESS_WRITES_DIR" "$BUSINESS_QUERY_LOG_WRITES_DIR" "$BUSINESS_QUER
 
 BUCKET_INTERVAL_MINUTES=$((BUCKET_INTERVAL_MINUTES))
 RESOURCE_HISTORY_DAYS=$((RESOURCE_HISTORY_DAYS))
+QUERY_TIME_RANGE_DAYS=$((QUERY_TIME_RANGE_DAYS))
+QUERY_TIME_RANGE_MAX_THREADS=$((QUERY_TIME_RANGE_MAX_THREADS))
+QUERY_TIME_RANGE_MAX_SECONDS=$((QUERY_TIME_RANGE_MAX_SECONDS))
 (( BUCKET_INTERVAL_MINUTES <= 0 )) && BUCKET_INTERVAL_MINUTES=30
 (( RESOURCE_HISTORY_DAYS <= 0 )) && RESOURCE_HISTORY_DAYS=30
+(( QUERY_TIME_RANGE_DAYS <= 0 )) && QUERY_TIME_RANGE_DAYS=30
+(( QUERY_TIME_RANGE_MAX_THREADS <= 0 )) && QUERY_TIME_RANGE_MAX_THREADS=2
+(( QUERY_TIME_RANGE_MAX_SECONDS <= 0 )) && QUERY_TIME_RANGE_MAX_SECONDS=300
 RESOURCE_HISTORY_MINUTES=$((RESOURCE_HISTORY_DAYS * 24 * 60))
 if (( RESOURCE_HISTORY_MINUTES < BUCKET_INTERVAL_MINUTES )); then
   RESOURCE_HISTORY_MINUTES=$BUCKET_INTERVAL_MINUTES
@@ -287,10 +333,66 @@ VM_BUCKET_INTERVAL_MINUTES=$((VM_BUCKET_INTERVAL_MINUTES))
 (( VM_BUCKET_INTERVAL_MINUTES <= 0 )) && VM_BUCKET_INTERVAL_MINUTES=60
 
 TMP_DIR=$(mktemp -d)
+VM_PORT_FORWARD_PID=""
 cleanup() {
+  if [[ -n "${VM_PORT_FORWARD_PID:-}" ]]; then
+    kill "$VM_PORT_FORWARD_PID" 2>/dev/null || true
+    wait "$VM_PORT_FORWARD_PID" 2>/dev/null || true
+  fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+
+start_vm_port_forward() {
+  local target
+  local attempt
+  local wait_step
+  local local_port
+  local log_file="$TMP_DIR/vm_port_forward.log"
+  for target in "pod/${VM_SERVICE}-0" "svc/${VM_SERVICE}"; do
+    for ((attempt=1; attempt<=30; attempt++)); do
+      local_port=$((20000 + RANDOM % 40000))
+      : >"$log_file"
+      kubectl -n "$VM_NAMESPACE" port-forward --address 127.0.0.1 "$target" "${local_port}:${VM_PORT}" >"$log_file" 2>&1 &
+      VM_PORT_FORWARD_PID=$!
+      for ((wait_step=1; wait_step<=50; wait_step++)); do
+        if grep -q "Forwarding from 127.0.0.1:${local_port}" "$log_file" || grep -q "Forwarding from \\[::1\\]:${local_port}" "$log_file"; then
+          VM_BASE_URL="http://127.0.0.1:${local_port}/select/${VM_TENANT_ID}/prometheus"
+          return 0
+        fi
+        if ! kill -0 "$VM_PORT_FORWARD_PID" 2>/dev/null; then
+          break
+        fi
+        sleep 0.1
+      done
+      kill "$VM_PORT_FORWARD_PID" 2>/dev/null || true
+      wait "$VM_PORT_FORWARD_PID" 2>/dev/null || true
+      VM_PORT_FORWARD_PID=""
+    done
+  done
+  return 1
+}
+
+VM_ENABLED="true"
+log "Connecting to VictoriaMetrics via kubectl port-forward"
+if ! start_vm_port_forward; then
+  >&2 echo "ERROR: Failed to establish VictoriaMetrics port-forward."
+  if [[ -s "$TMP_DIR/vm_port_forward.log" ]]; then
+    >&2 echo "  port-forward log (last 20 lines):"
+    >&2 tail -n 20 "$TMP_DIR/vm_port_forward.log" | sed 's/^/  /'
+  fi
+  exit 1
+fi
+VM_BASE_URL_TRIMMED="${VM_BASE_URL%/}"
+if ! curl -sS --fail --get --data-urlencode "query=1" "${VM_BASE_URL_TRIMMED}/api/v1/query" >/dev/null 2>&1; then
+  >&2 echo "ERROR: VictoriaMetrics is not reachable after port-forward: $VM_BASE_URL"
+  if [[ -s "$TMP_DIR/vm_port_forward.log" ]]; then
+    >&2 echo "  port-forward log (last 20 lines):"
+    >&2 tail -n 20 "$TMP_DIR/vm_port_forward.log" | sed 's/^/  /'
+  fi
+  exit 1
+fi
+log "VictoriaMetrics is reachable via port-forward: $VM_BASE_URL"
 
 CLICKHOUSE_CLIENT_BASE=(
   kubectl exec -i -n "$CK_K8S_NAMESPACE" "$CK_K8S_POD" --
@@ -300,6 +402,9 @@ CLICKHOUSE_CLIENT_BASE=(
   --param_CK_DATABASE_BUSINESS "$CK_DATABASE_BUSINESS"
   --param_bucket_interval_minutes "$BUCKET_INTERVAL_MINUTES"
   --param_resource_history_days "$RESOURCE_HISTORY_DAYS"
+  --param_query_time_range_days "$QUERY_TIME_RANGE_DAYS"
+  --param_query_time_range_max_threads "$QUERY_TIME_RANGE_MAX_THREADS"
+  --param_query_time_range_max_seconds "$QUERY_TIME_RANGE_MAX_SECONDS"
 )
 
 run_clickhouse_json_lines() {
@@ -431,9 +536,10 @@ parse_business_time_config() {
   }
   function flush_entry() {
     if (db != "" && tbl != "" && col != "") {
-      printf "%s\t%s\t%s\t%s\t%s\n", db, tbl, col, typ, fmt >> OUT
+      out_fmt = (fmt == "" ? "-" : fmt)
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n", db, tbl, col, typ, out_fmt, qcol >> OUT
     }
-    db=""; tbl=""; col=""; typ=""; fmt=""
+    db=""; tbl=""; col=""; typ=""; fmt=""; qcol=""
   }
   /^[[:space:]]*#/ {next}
   /^[[:space:]]*$/ {next}
@@ -464,12 +570,15 @@ parse_business_time_config() {
       value=substr(line, index(line, ":") + 1)
       key=trim(tolower(key))
       value=trim(value)
+      gsub(/[^a-z0-9_]/, "", key)
       if (key == "database") {
         db=value
       } else if (key == "table") {
         tbl=value
       } else if (key == "time_column") {
         col=value
+      } else if (key == "query_time_column" || key == "query_column") {
+        qcol=value
       } else if (key == "time_type") {
         typ=value
       } else if (key == "time_format") {
@@ -698,7 +807,7 @@ fi
 # business 表写入按时间切片输出（每个表一个 CSV）
 log "Collecting business table write statistics per time column"
 # 为每个 business 表执行一次分桶统计并生成独立 CSV
-while IFS=$'\t' read -r BT_DB BT_TABLE BT_COLUMN BT_TYPE BT_FORMAT; do
+while IFS=$'\t' read -r BT_DB BT_TABLE BT_COLUMN BT_TYPE BT_FORMAT _; do
   [[ -z "$BT_DB" || -z "$BT_TABLE" || -z "$BT_COLUMN" ]] && continue
   DB_IDENT=$(printf '%s' "$BT_DB" | sed 's/"/""/g')
   TABLE_IDENT=$(printf '%s' "$BT_TABLE" | sed 's/"/""/g')
@@ -950,6 +1059,195 @@ else
   log "WARNING: system.query_log.query_duration_ms not found. Skipping slow queries export."
 fi
 
+log "Collecting query time range distribution (last ${QUERY_TIME_RANGE_DAYS} days)"
+QUERY_TIME_RANGE_CSV="$OUTPUT_DIR/query_time_range_distribution.csv"
+echo "table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_CSV"
+if ck_has_column "system" "query_log" "tables"; then
+  QUERY_LOG_FILTER=""
+  if ck_has_column "system" "query_log" "event_date"; then
+    QUERY_LOG_FILTER="AND ql.event_date >= today() - {query_time_range_days:Int32}"
+  fi
+  IN_CONFIG_CASES=""
+  TS_START_CASES=""
+  TS_END_CASES=""
+  TS_START_DATE_CASES=""
+  TS_END_DATE_CASES=""
+  TABLE_DB_EXPR="if(position(t, '.') > 0, splitByChar('.', t)[1], {CK_DATABASE_BUSINESS:String}) AS table_db"
+  TABLE_TBL_EXPR="if(position(t, '.') > 0, splitByChar('.', t)[2], t) AS table_tbl"
+  while IFS=$'\t' read -r TT_DB TT_TABLE TT_COLUMN TT_TYPE TT_FORMAT TT_QUERY_COLUMN; do
+    [[ -z "$TT_DB" || -z "$TT_TABLE" || -z "$TT_COLUMN" ]] && continue
+    TT_DB_SQL=${TT_DB//\'/\'\'}
+    TT_TABLE_SQL=${TT_TABLE//\'/\'\'}
+    TT_QUERY_COL="${TT_QUERY_COLUMN:-$TT_COLUMN}"
+    TT_COLUMN_REGEX=$(printf '%s' "$TT_QUERY_COL" | sed -e 's/[\\.^$|()\[\]{}*+?]/\\\\&/g')
+    TT_COLUMN_REGEX_CH=${TT_COLUMN_REGEX//\\/\\\\}
+    TT_COLUMN_REGEX_SQL=${TT_COLUMN_REGEX_CH//\'/\'\'}
+    COND="(table_db = '$TT_DB_SQL' AND table_tbl = '$TT_TABLE_SQL')"
+    IN_CONFIG_CASES+="$COND, 1, "
+    TS_START_CASES+="$COND, extractAll(ql.query, '(?i)\\\\b${TT_COLUMN_REGEX_SQL}\\\\b\\\\s*(?:>=|>)\\\\s*([0-9]{9,19})'), "
+    TS_END_CASES+="$COND, extractAll(ql.query, '(?i)\\\\b${TT_COLUMN_REGEX_SQL}\\\\b\\\\s*(?:<=|<)\\\\s*([0-9]{9,19})'), "
+    TS_START_DATE_CASES+="$COND, extractAll(ql.query, '(?i)\\\\b${TT_COLUMN_REGEX_SQL}\\\\b\\\\s*(?:>=|>)\\\\s*[^0-9]{0,32}((?:19|20)\\\\d{2}-\\\\d{2}-\\\\d{2})'), "
+    TS_END_DATE_CASES+="$COND, extractAll(ql.query, '(?i)\\\\b${TT_COLUMN_REGEX_SQL}\\\\b\\\\s*(?:<=|<)\\\\s*[^0-9]{0,32}((?:19|20)\\\\d{2}-\\\\d{2}-\\\\d{2})'), "
+  done <"$BUSINESS_TIME_TARGETS_FILE"
+
+  if [[ -z "$IN_CONFIG_CASES" ]]; then
+    log "WARNING: business-time-config parsed empty. Skipping query time range distribution."
+  else
+    QUERY_TIME_RANGE_SQL=$(cat <<SQL
+WITH
+    per_query AS (
+      SELECT *
+      FROM
+      (
+        SELECT
+          ql.event_time,
+          $TABLE_DB_EXPR,
+          $TABLE_TBL_EXPR,
+          multiIf($IN_CONFIG_CASES 0) AS in_config,
+
+          extractAll(ql.query, '(?i)INTERVAL\\s+(\\d+)\\s+DAY') AS interval_days_matches,
+          extractAll(ql.query, '(?i)INTERVAL\\s+(\\d+)\\s+HOUR') AS interval_hours_matches,
+          extractAll(ql.query, '(\\d{4}-\\d{2}-\\d{2})') AS all_date_strs,
+          extractAll(ql.query, '(?i)(?:>|>=)[^0-9]{0,32}(\\d{4}-\\d{2}-\\d{2})') AS greater_than_matches,
+
+          multiIf($TS_START_CASES []) AS ts_start_matches,
+          multiIf($TS_END_CASES []) AS ts_end_matches,
+          multiIf($TS_START_DATE_CASES []) AS date_start_matches,
+          multiIf($TS_END_DATE_CASES []) AS date_end_matches
+        FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log) AS ql
+        ARRAY JOIN ql.tables AS t
+        WHERE
+          ql.event_time >= now() - INTERVAL {query_time_range_days:Int32} DAY
+          $QUERY_LOG_FILTER
+          AND ql.type = 'QueryFinish'
+          AND ql.is_initial_query = 1
+          AND ql.query_kind = 'Select'
+          AND has(ql.databases, {CK_DATABASE_BUSINESS:String})
+          AND (
+            startsWith(t, concat({CK_DATABASE_BUSINESS:String}, '.'))
+            OR
+            (position(t, '.') = 0 AND has(ql.databases, {CK_DATABASE_BUSINESS:String}))
+          )
+      )
+      WHERE in_config = 1
+    ),
+    per_query_ranges AS (
+      SELECT
+        table_name,
+        multiIf(
+          ts_start_dt > toDateTime(0) AND ts_end_dt > toDateTime(0) AND ts_end_dt >= ts_start_dt,
+            greatest(1.0, dateDiff('second', ts_start_dt, ts_end_dt) / 86400.0),
+          ts_start_dt > toDateTime(0),
+            greatest(1.0, dateDiff('second', ts_start_dt, event_time) / 86400.0),
+          date_start_dt > toDateTime(0) AND date_end_dt > toDateTime(0) AND date_end_dt >= date_start_dt,
+            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(date_end_dt)) + 1)),
+          date_start_dt > toDateTime(0),
+            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(event_time)) + 1)),
+          length(interval_days_matches) > 0,
+            toFloat64(arrayMax(arrayMap(x -> toInt64OrZero(x), interval_days_matches))),
+          length(interval_hours_matches) > 0,
+            toFloat64(arrayMax(arrayMap(x -> toInt64OrZero(x), interval_hours_matches))) / 24.0,
+          length(start_daynums) > 0,
+            greatest(1.0, toFloat64(toRelativeDayNum(toDate(event_time)) - arrayMax(start_daynums) + 1)),
+          length(valid_daynums) >= 2,
+            greatest(1.0, toFloat64(arrayMax(valid_daynums) - arrayMin(valid_daynums) + 1)),
+          0.0
+        ) AS estimated_days_range
+      FROM
+      (
+        SELECT
+          event_time,
+          table_tbl AS table_name,
+          interval_days_matches,
+          interval_hours_matches,
+          all_date_strs,
+          greater_than_matches,
+          ts_start_matches,
+          ts_end_matches,
+          date_start_matches,
+          date_end_matches,
+          if(length(ts_start_matches) > 0, arrayMax(arrayMap(x -> toInt64OrZero(x), ts_start_matches)), toInt64(0)) AS ts_start_raw,
+          if(
+            length(ts_end_matches) > 0,
+            if(
+              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches)) = toInt64(9223372036854775807),
+              toInt64(0),
+              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches))
+            ),
+            toInt64(0)
+          ) AS ts_end_raw,
+          if(ts_start_raw > 0, toDateTime(ts_start_raw), toDateTime(0)) AS ts_start_dt,
+          if(ts_end_raw > 0, toDateTime(ts_end_raw), toDateTime(0)) AS ts_end_dt,
+          arrayFilter(d -> d > toDate(0), arrayMap(x -> toDateOrZero(x), all_date_strs)) AS valid_dates,
+          arrayMap(d -> toRelativeDayNum(d), valid_dates) AS valid_daynums,
+          arrayFilter(d -> d > toDate(0), arrayMap(x -> toDateOrZero(extract(x, '\\d{4}-\\d{2}-\\d{2}')), greater_than_matches)) AS start_dates,
+          arrayMap(d -> toRelativeDayNum(d), start_dates) AS start_daynums,
+          if(length(date_start_matches) > 0, arrayMax(arrayMap(x -> toInt32(toRelativeDayNum(toDateOrZero(x))), date_start_matches)), toInt32(0)) AS date_start_daynum,
+          if(
+            length(date_end_matches) > 0,
+            if(
+              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches)) = toInt32(2147483647),
+              toInt32(0),
+              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches))
+            ),
+            toInt32(0)
+          ) AS date_end_daynum,
+          if(date_start_daynum > 0, toDateTime(addDays(toDate(0), date_start_daynum)), toDateTime(0)) AS date_start_dt,
+          if(date_end_daynum > 0, toDateTime(addDays(toDate(0), date_end_daynum)), toDateTime(0)) AS date_end_dt
+        FROM per_query
+      )
+    )
+
+SELECT *
+FROM
+(
+  SELECT
+    table_name,
+    count() AS query_count,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
+    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
+    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
+    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
+    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+  FROM per_query_ranges
+  GROUP BY table_name
+
+  UNION ALL
+
+  SELECT
+    '__ALL__' AS table_name,
+    count() AS query_count,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
+    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
+    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
+    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
+    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+  FROM per_query_ranges
+)
+ORDER BY query_count DESC
+SETTINGS
+  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
+SQL
+)
+    if ! run_clickhouse_to_csv "$QUERY_TIME_RANGE_SQL" "$QUERY_TIME_RANGE_CSV"; then
+      log "WARNING: Failed to collect query time range distribution"
+    fi
+  fi
+else
+  log "WARNING: system.query_log.tables not found. Skipping query time range distribution."
+fi
+
 # CK parts/partition 压力快照（用于判断合并压力与迁移风险）
 log "Collecting parts and partitions snapshot (CSV)"
 PARTS_SNAPSHOT_CSV="$SNAPSHOTS_DIR/cluster_parts_snapshot.csv"
@@ -960,7 +1258,7 @@ SELECT
   count() AS active_parts,
   uniqExact(partition) AS partitions,
   sum(rows) AS rows,
-  sum(bytes_on_disk) AS bytes_on_disk,
+  sum(bytes_on_disk) AS sum_bytes_on_disk,
   max(bytes_on_disk) AS max_part_bytes_on_disk
 FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.parts)
 WHERE
@@ -972,7 +1270,7 @@ WHERE
       WHERE cluster = '${CK_CLUSTER_NAME}' AND replica_num = 1
   )
 GROUP BY database, table
-ORDER BY bytes_on_disk DESC, database, table
+ORDER BY sum_bytes_on_disk DESC, database, table
 SQL
 )
 if ! run_clickhouse_to_csv "$PARTS_SNAPSHOT_SQL" "$PARTS_SNAPSHOT_CSV"; then
