@@ -15,7 +15,7 @@ Optional options:
   --ck-password PASSWORD             ClickHouse password (or set CK_PASSWORD; default from k8s secret root)
   --ck-database-business NAME        Business database name (default "business" or CK_DATABASE_BUSINESS)
   --bucket-interval-minutes MINS     Bucket interval for time series stats (default 30 or BUCKET_INTERVAL_MINUTES)
-  --resource-history-days DAYS       Lookback window for node metrics and query_log stats (default 180 or RESOURCE_HISTORY_DAYS)
+  --resource-history-days DAYS       Lookback window for node metrics and query_log stats (default 30 or RESOURCE_HISTORY_DAYS)
   --query-time-range-days DAYS       Lookback window for time range stats (default 30 or QUERY_TIME_RANGE_DAYS)
   --query-time-range-max-threads N   max_threads for time range query (default 2 or QUERY_TIME_RANGE_MAX_THREADS)
   --query-time-range-max-seconds N   max_execution_time seconds (default 300 or QUERY_TIME_RANGE_MAX_SECONDS)
@@ -105,7 +105,7 @@ CK_USER="${CK_USER:-}"
 CK_PASSWORD="${CK_PASSWORD:-}"
 CK_DATABASE_BUSINESS="${CK_DATABASE_BUSINESS:-business}"
 BUCKET_INTERVAL_MINUTES="${BUCKET_INTERVAL_MINUTES:-30}"
-RESOURCE_HISTORY_DAYS="${RESOURCE_HISTORY_DAYS:-180}"
+RESOURCE_HISTORY_DAYS="${RESOURCE_HISTORY_DAYS:-30}"
 QUERY_TIME_RANGE_DAYS="${QUERY_TIME_RANGE_DAYS:-30}"
 QUERY_TIME_RANGE_MAX_THREADS="${QUERY_TIME_RANGE_MAX_THREADS:-2}"
 QUERY_TIME_RANGE_MAX_SECONDS="${QUERY_TIME_RANGE_MAX_SECONDS:-300}"
@@ -1356,6 +1356,25 @@ vm_query_instant_to_file() {
   fi
 }
 
+vm_query_range_to_file() {
+  local promql="$1"
+  local start_ts="$2"
+  local end_ts="$3"
+  local step_seconds="$4"
+  local outfile="$5"
+  local base="${VM_BASE_URL%/}"
+  if [[ "$VM_ENABLED" != "true" ]]; then
+    printf '{"status":"error","data":{"result":[]}}' >"$outfile"
+    return 0
+  fi
+  curl -sS --fail --get \
+    --data-urlencode "query=$promql" \
+    --data-urlencode "start=$start_ts" \
+    --data-urlencode "end=$end_ts" \
+    --data-urlencode "step=$step_seconds" \
+    "$base/api/v1/query_range" >"$outfile"
+}
+
 parse_vm_disk_snapshot() {
   local src="$1"
   local dest="$2"
@@ -1460,48 +1479,45 @@ MEM_USAGE_PERCENT=$(calc_percentage "$MEM_USED" "$MEM_TOTAL")
 DISK_USAGE_PERCENT=$(calc_percentage "$DISK_USED" "$DISK_TOTAL")
 
 # 下方为调用 VictoriaMetrics 的辅助函数（封装 PromQL 构造与结果解析）
-render_selector_placeholder() {
-  local template="$1"
-  local rendered="${template//\{\{VM_NODE_SELECTOR\}\}/$VM_NODE_SELECTOR}"
-  rendered="${rendered//\{\{VM_CK_POD_SELECTOR\}\}/$VM_CK_POD_SELECTOR}"
-  echo "$rendered"
-}
-
-vm_query_to_file() {
-  local promql="$1"
-  local outfile="$2"
-  local base="${VM_BASE_URL%/}"
-  if [[ "$VM_ENABLED" != "true" ]]; then
-    printf '{"status":"error","data":{"result":[]}}' >"$outfile"
-    return 0
-  fi
-  curl -sS --fail --get --data-urlencode "query=$promql" "$base/api/v1/query" >"$outfile"
-}
-
-parse_vm_vector_response() {
+parse_vm_matrix_response() {
   local src="$1"
   local dest="$2"
   local label="${3:-instance}"
   : >"$dest"
-  tr -d '[:space:]' < "$src" \
-    | sed 's/{"metric":/\n{"metric":/g' \
-    | sed -n "s/.*\"$label\":\"\([^\"]\+\)\".*\"value\":\[[^,]\+,\"\([^\"]\+\)\"\].*/\\1\t\\2/p" \
-    >> "$dest"
-}
-
-build_metric_selector() {
-  local extra="$1"
-  local selector="$VM_NODE_SELECTOR"
-  if [[ -n "$selector" && -n "$extra" ]]; then
-    selector="$selector,$extra"
-  elif [[ -z "$selector" && -n "$extra" ]]; then
-    selector="$extra"
-  fi
-  if [[ -n "$selector" ]]; then
-    printf "{%s}" "$selector"
-  else
-    printf "{}"
-  fi
+  awk -v DEST="$dest" -v LABEL="$label" '
+  {
+    raw = raw $0
+  }
+  END {
+    gsub(/[[:space:]]+/, "", raw)
+    n = split(raw, parts, /\{"metric":/)
+    for (i = 2; i <= n; i++) {
+      chunk = "{\"metric\":" parts[i]
+      if (!match(chunk, "\"" LABEL "\":\"([^\"]+)\"", m)) {
+        continue
+      }
+      key = m[1]
+      values_pos = index(chunk, "\"values\":[")
+      if (values_pos == 0) {
+        continue
+      }
+      rest = substr(chunk, values_pos + 9)
+      end_pos = index(rest, "]}")
+      if (end_pos == 0) {
+        continue
+      }
+      values = substr(rest, 1, end_pos - 1)
+      gsub(/^\[/, "", values)
+      gsub(/\]$/, "", values)
+      gsub(/\],\[/, "]\n[", values)
+      pcount = split(values, pts, /\n/)
+      for (j = 1; j <= pcount; j++) {
+        if (match(pts[j], /\[([0-9]+(\.[0-9]+)?),"([^"]*)"\]/, mm)) {
+          print key "\t" mm[1] "\t" mm[3] >> DEST
+        }
+      }
+    }
+  }' "$src"
 }
 
 build_cluster_selector() {
@@ -1525,25 +1541,28 @@ build_cluster_selector() {
   fi
 }
 
-vm_fetch_vector_tsv() {
+vm_fetch_range_tsv() {
   local promql="$1"
-  local eval_ts="$2"
-  local dest="$3"
-  local label="${4:-instance}"
+  local start_ts="$2"
+  local end_ts="$3"
+  local step_seconds="$4"
+  local dest="$5"
+  local label="${6:-instance}"
   local json_tmp
-  json_tmp=$(mktemp "$TMP_DIR/vm_vector_json.XXXXXX")
-  if vm_query_instant_to_file "$promql" "$eval_ts" "$json_tmp"; then
-    parse_vm_vector_response "$json_tmp" "$dest" "$label"
+  json_tmp=$(mktemp "$TMP_DIR/vm_range_json.XXXXXX")
+  if vm_query_range_to_file "$promql" "$start_ts" "$end_ts" "$step_seconds" "$json_tmp"; then
+    parse_vm_matrix_response "$json_tmp" "$dest" "$label"
   else
     : >"$dest"
   fi
   rm -f "$json_tmp"
 }
 
-join_vm_metrics_to_tsv() {
-  local dest="$1"
-  shift
-  : >"$dest"
+join_vm_range_metrics_to_csv() {
+  local dest_csv="$1"
+  local step_seconds="$2"
+  local strip_port="$3"
+  shift 3
   local metric_names=()
   local metric_files=()
   while [[ $# -gt 1 ]]; do
@@ -1553,54 +1572,46 @@ join_vm_metrics_to_tsv() {
   done
   local names_csv
   names_csv=$(IFS=','; echo "${metric_names[*]}")
-  awk -F'\t' -v DEST="$dest" -v NAMES="$names_csv" '
+  awk -F'\t' -v OFS=',' -v DEST="$dest_csv" -v STEP="$step_seconds" -v NAMES="$names_csv" -v STRIP_PORT="$strip_port" '
   BEGIN {
     split(NAMES, metric_names, ",")
+    ENVIRON["TZ"] = "UTC"
   }
   {
-    if (NF < 2) next
-    node=$1
-    value=$2
-    metric=metric_names[ARGIND]
-    data[node,metric]=value
-    nodes[node]=1
+    if (NF < 3) next
+    key = $1
+    ts = $2 + 0
+    value = $3
+    metric = metric_names[ARGIND]
+    data[key, ts, metric] = value
+    rows[sprintf("%013d\t%s", ts, key)] = 1
   }
   END {
     PROCINFO["sorted_in"] = "@ind_str_asc"
-    for (node in nodes) {
-      line=node
-      for (i=1; i<=length(metric_names); i++) {
-        key=node SUBSEP metric_names[i]
-        if (key in data) {
-          line=line "\t" data[key]
+    for (rk in rows) {
+      split(rk, parts, "\t")
+      ts = parts[1] + 0
+      key = parts[2]
+      out_key = key
+      if (STRIP_PORT == "true") {
+        sub(/:.*/, "", out_key)
+      }
+      start_ts = ts - STEP
+      start_iso = strftime("%Y-%m-%dT%H:%M:%SZ", start_ts)
+      end_iso = strftime("%Y-%m-%dT%H:%M:%SZ", ts)
+      line = out_key "," start_iso "," end_iso
+      for (i = 1; i <= length(metric_names); i++) {
+        m = metric_names[i]
+        k = key SUBSEP ts SUBSEP m
+        if (k in data) {
+          line = line "," data[k]
         } else {
-          line=line "\t"
+          line = line ","
         }
       }
-      print line > DEST
+      print line >> DEST
     }
   }' "${metric_files[@]}"
-}
-
-extract_vm_scalar() {
-  local file="$1"
-  awk 'match($0, /"value":\[[^,]+,"([^"]*)"\]/, m) {print m[1]; exit}' "$file"
-}
-
-vm_fetch_single_value() {
-  local promql="$1"
-  local eval_ts="$2"
-  local json_tmp
-  local tsv_tmp
-  json_tmp=$(mktemp "$TMP_DIR/vm_single_json.XXXXXX")
-  tsv_tmp=$(mktemp "$TMP_DIR/vm_single_tsv.XXXXXX")
-  local value=""
-  if vm_query_instant_to_file "$promql" "$eval_ts" "$json_tmp"; then
-    parse_vm_vector_response "$json_tmp" "$tsv_tmp"
-    value=$(awk -F'\t' 'NR==1 {print $2}' "$tsv_tmp")
-  fi
-  rm -f "$json_tmp" "$tsv_tmp"
-  printf '%s' "$value"
 }
 
 VM_STEP_SECONDS=$((VM_BUCKET_INTERVAL_MINUTES * 60))
@@ -1644,44 +1655,35 @@ CK_POD_NET_TX_PROMQL=$(printf "avg_over_time(sum by (pod) (rate(container_networ
 CK_POD_DISK_R_PROMQL=$(printf "avg_over_time(sum by (pod) (rate(container_fs_reads_bytes_total{namespace=\"%s\"}[5m])) / 1000000 [%s])" "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_DISK_W_PROMQL=$(printf "avg_over_time(sum by (pod) (rate(container_fs_writes_bytes_total{namespace=\"%s\"}[5m])) / 1000000 [%s])" "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_THROTTLE_PROMQL=$(printf 'avg_over_time(sum by (pod) (rate(container_cpu_cfs_throttled_seconds_total{namespace="%s", container!="POD", container!=""}[5m])) * 100 [%s])' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
-for ((bucket_index=0; bucket_index<VM_RESOURCE_BUCKET_COUNT; bucket_index++)); do
-  bucket_start=$((OLDEST_BUCKET_START + bucket_index * VM_STEP_SECONDS))
-  bucket_end=$((bucket_start + VM_STEP_SECONDS))
-  progress_minutes=$(((bucket_index + 1) * VM_BUCKET_INTERVAL_MINUTES))
-  progress_days=$(awk -v m="$progress_minutes" 'BEGIN {printf "%.2f", m/1440}')
-  log_progress "Collecting CK Pod metrics: ${progress_days}/${RESOURCE_HISTORY_DAYS} days (bucket $((bucket_index+1))/$VM_RESOURCE_BUCKET_COUNT)"
-  start_time_iso=$(date -u -d "@$bucket_start" +"%Y-%m-%dT%H:%M:%SZ")
-  end_time_iso=$(date -u -d "@$bucket_end" +"%Y-%m-%dT%H:%M:%SZ")
-  CPU_TSV=$(mktemp "$TMP_DIR/ck_pod_cpu.XXXXXX")
-  MEM_TSV=$(mktemp "$TMP_DIR/ck_pod_mem.XXXXXX")
-  NET_RX_TSV=$(mktemp "$TMP_DIR/ck_pod_rx.XXXXXX")
-  NET_TX_TSV=$(mktemp "$TMP_DIR/ck_pod_tx.XXXXXX")
-  DISK_R_TSV=$(mktemp "$TMP_DIR/ck_pod_dr.XXXXXX")
-  DISK_W_TSV=$(mktemp "$TMP_DIR/ck_pod_dw.XXXXXX")
-  THROTTLE_TSV=$(mktemp "$TMP_DIR/ck_pod_thr.XXXXXX")
-  vm_fetch_vector_tsv "$CK_POD_CPU_PROMQL" "$bucket_end" "$CPU_TSV" "pod"
-  vm_fetch_vector_tsv "$CK_POD_MEM_PROMQL" "$bucket_end" "$MEM_TSV" "pod"
-  vm_fetch_vector_tsv "$CK_POD_NET_RX_PROMQL" "$bucket_end" "$NET_RX_TSV" "pod"
-  vm_fetch_vector_tsv "$CK_POD_NET_TX_PROMQL" "$bucket_end" "$NET_TX_TSV" "pod"
-  vm_fetch_vector_tsv "$CK_POD_DISK_R_PROMQL" "$bucket_end" "$DISK_R_TSV" "pod"
-  vm_fetch_vector_tsv "$CK_POD_DISK_W_PROMQL" "$bucket_end" "$DISK_W_TSV" "pod"
-  vm_fetch_vector_tsv "$CK_POD_THROTTLE_PROMQL" "$bucket_end" "$THROTTLE_TSV" "pod"
-  JOINED_TSV=$(mktemp "$TMP_DIR/ck_pod_joined.XXXXXX")
-  join_vm_metrics_to_tsv "$JOINED_TSV" \
-    "cpu" "$CPU_TSV" \
-    "mem" "$MEM_TSV" \
-    "rx" "$NET_RX_TSV" \
-    "tx" "$NET_TX_TSV" \
-    "dr" "$DISK_R_TSV" \
-    "dw" "$DISK_W_TSV" \
-    "thr" "$THROTTLE_TSV"
-  while IFS=$'\t' read -r pod_name cpu_val mem_val rx_val tx_val dr_val dw_val thr_val; do
-    [[ -z "$pod_name" ]] && continue
-    echo "${pod_name},${start_time_iso},${end_time_iso},${cpu_val:-},${mem_val:-},${rx_val:-},${tx_val:-},${dr_val:-},${dw_val:-},${thr_val:-}" >> "$CK_POD_TIMESERIES_CSV"
-  done <"$JOINED_TSV"
-  rm -f "$CPU_TSV" "$MEM_TSV" "$NET_RX_TSV" "$NET_TX_TSV" "$DISK_R_TSV" "$DISK_W_TSV" "$THROTTLE_TSV" "$JOINED_TSV"
-done
->&2 echo ""
+POD_RANGE_START_TS=$((OLDEST_BUCKET_START + VM_STEP_SECONDS))
+POD_RANGE_END_TS=$CURRENT_TS
+if (( POD_RANGE_END_TS < POD_RANGE_START_TS )); then
+  POD_RANGE_END_TS=$POD_RANGE_START_TS
+fi
+log "Collecting CK Pod metrics from VM via query_range (start=${POD_RANGE_START_TS}, end=${POD_RANGE_END_TS}, step=${VM_STEP_SECONDS})"
+CPU_TSV=$(mktemp "$TMP_DIR/ck_pod_cpu_range.tsv.XXXXXX")
+MEM_TSV=$(mktemp "$TMP_DIR/ck_pod_mem_range.tsv.XXXXXX")
+NET_RX_TSV=$(mktemp "$TMP_DIR/ck_pod_rx_range.tsv.XXXXXX")
+NET_TX_TSV=$(mktemp "$TMP_DIR/ck_pod_tx_range.tsv.XXXXXX")
+DISK_R_TSV=$(mktemp "$TMP_DIR/ck_pod_dr_range.tsv.XXXXXX")
+DISK_W_TSV=$(mktemp "$TMP_DIR/ck_pod_dw_range.tsv.XXXXXX")
+THROTTLE_TSV=$(mktemp "$TMP_DIR/ck_pod_thr_range.tsv.XXXXXX")
+vm_fetch_range_tsv "$CK_POD_CPU_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CPU_TSV" "pod"
+vm_fetch_range_tsv "$CK_POD_MEM_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$MEM_TSV" "pod"
+vm_fetch_range_tsv "$CK_POD_NET_RX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$NET_RX_TSV" "pod"
+vm_fetch_range_tsv "$CK_POD_NET_TX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$NET_TX_TSV" "pod"
+vm_fetch_range_tsv "$CK_POD_DISK_R_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$DISK_R_TSV" "pod"
+vm_fetch_range_tsv "$CK_POD_DISK_W_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$DISK_W_TSV" "pod"
+vm_fetch_range_tsv "$CK_POD_THROTTLE_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$THROTTLE_TSV" "pod"
+join_vm_range_metrics_to_csv "$CK_POD_TIMESERIES_CSV" "$VM_STEP_SECONDS" "false" \
+  "cpu_usage_percent" "$CPU_TSV" \
+  "memory_usage_bytes" "$MEM_TSV" \
+  "net_rx_mbps" "$NET_RX_TSV" \
+  "net_tx_mbps" "$NET_TX_TSV" \
+  "disk_read_mbps" "$DISK_R_TSV" \
+  "disk_write_mbps" "$DISK_W_TSV" \
+  "cpu_throttle_percent" "$THROTTLE_TSV"
+rm -f "$CPU_TSV" "$MEM_TSV" "$NET_RX_TSV" "$NET_TX_TSV" "$DISK_R_TSV" "$DISK_W_TSV" "$THROTTLE_TSV"
 
 # 集群所有节点资源分时序列（来自 VM）
 NODE_CLUSTER_TIMESERIES_CSV="$TIMESERIES_DIR/cluster_node_usage_timeseries.csv"
@@ -1715,58 +1717,47 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   CLUSTER_DISK_WRITE_PROMQL=$(printf "avg_over_time((sum by (instance) (rate(node_disk_written_bytes_total%s[5m])) / 1000000) [%s])" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_NET_RX_PROMQL=$(printf "avg_over_time((sum by (instance) (rate(node_network_receive_bytes_total%s[5m])) / 1000000) [%s])" "$CLUSTER_NET_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_NET_TX_PROMQL=$(printf "avg_over_time((sum by (instance) (rate(node_network_transmit_bytes_total%s[5m])) / 1000000) [%s])" "$CLUSTER_NET_SELECTOR" "$VM_BUCKET_WINDOW")
-  for ((bucket_index=0; bucket_index<VM_RESOURCE_BUCKET_COUNT; bucket_index++)); do
-    bucket_start=$((OLDEST_BUCKET_START + bucket_index * VM_STEP_SECONDS))
-    bucket_end=$((bucket_start + VM_STEP_SECONDS))
-    progress_minutes=$(((bucket_index + 1) * VM_BUCKET_INTERVAL_MINUTES))
-    progress_days=$(awk -v m="$progress_minutes" 'BEGIN {printf "%.2f", m/1440}')
-    log_progress "Collecting cluster node metrics (${CLUSTER_TARGET_LABEL:-auto-selector}): ${progress_days}/${RESOURCE_HISTORY_DAYS} days (hour bucket $((bucket_index+1))/$VM_RESOURCE_BUCKET_COUNT)"
-    start_time_iso=$(date -u -d "@$bucket_start" +"%Y-%m-%dT%H:%M:%SZ")
-    end_time_iso=$(date -u -d "@$bucket_end" +"%Y-%m-%dT%H:%M:%SZ")
-    CPU_TSV=$(mktemp "$TMP_DIR/vm_cpu_tsv.XXXXXX")
-    MEM_TSV=$(mktemp "$TMP_DIR/vm_mem_tsv.XXXXXX")
-    DISK_TSV=$(mktemp "$TMP_DIR/vm_disk_tsv.XXXXXX")
-    LOAD1_TSV=$(mktemp "$TMP_DIR/vm_load1_tsv.XXXXXX")
-    LOAD5_TSV=$(mktemp "$TMP_DIR/vm_load5_tsv.XXXXXX")
-    LOAD15_TSV=$(mktemp "$TMP_DIR/vm_load15_tsv.XXXXXX")
-    SWAP_TSV=$(mktemp "$TMP_DIR/vm_swap_tsv.XXXXXX")
-    DISK_READ_TSV=$(mktemp "$TMP_DIR/vm_disk_read_tsv.XXXXXX")
-    DISK_WRITE_TSV=$(mktemp "$TMP_DIR/vm_disk_write_tsv.XXXXXX")
-    NET_RX_TSV=$(mktemp "$TMP_DIR/vm_net_rx_tsv.XXXXXX")
-    NET_TX_TSV=$(mktemp "$TMP_DIR/vm_net_tx_tsv.XXXXXX")
-    vm_fetch_vector_tsv "$CLUSTER_CPU_PROMQL" "$bucket_end" "$CPU_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_MEM_PROMQL" "$bucket_end" "$MEM_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_DISK_PROMQL" "$bucket_end" "$DISK_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_LOAD1_PROMQL" "$bucket_end" "$LOAD1_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_LOAD5_PROMQL" "$bucket_end" "$LOAD5_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_LOAD15_PROMQL" "$bucket_end" "$LOAD15_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_SWAP_PROMQL" "$bucket_end" "$SWAP_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_DISK_READ_PROMQL" "$bucket_end" "$DISK_READ_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_DISK_WRITE_PROMQL" "$bucket_end" "$DISK_WRITE_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_NET_RX_PROMQL" "$bucket_end" "$NET_RX_TSV" "instance"
-    vm_fetch_vector_tsv "$CLUSTER_NET_TX_PROMQL" "$bucket_end" "$NET_TX_TSV" "instance"
-    JOINED_TSV=$(mktemp "$TMP_DIR/vm_joined_tsv.XXXXXX")
-    # 多指标结果分别存储，这里通过 join_vm_metrics_to_tsv 统一按节点合并，避免遗漏
-    join_vm_metrics_to_tsv "$JOINED_TSV" \
-      "cpu" "$CPU_TSV" \
-      "mem" "$MEM_TSV" \
-      "disk" "$DISK_TSV" \
-      "load1" "$LOAD1_TSV" \
-      "load5" "$LOAD5_TSV" \
-      "load15" "$LOAD15_TSV" \
-      "swap" "$SWAP_TSV" \
-      "disk_read" "$DISK_READ_TSV" \
-      "disk_write" "$DISK_WRITE_TSV" \
-      "net_rx" "$NET_RX_TSV" \
-      "net_tx" "$NET_TX_TSV"
-    while IFS=$'\t' read -r node_name cpu_val mem_val disk_val load1_val load5_val load15_val swap_val disk_read_val disk_write_val net_rx_val net_tx_val; do
-      [[ -z "$node_name" ]] && continue
-      clean_node_name="${node_name%%:*}"
-      echo "${clean_node_name},${start_time_iso},${end_time_iso},${cpu_val:-},${mem_val:-},${disk_val:-},${load1_val:-},${load5_val:-},${load15_val:-},${swap_val:-},${disk_read_val:-},${disk_write_val:-},${net_rx_val:-},${net_tx_val:-}" >> "$NODE_CLUSTER_TIMESERIES_CSV"
-    done <"$JOINED_TSV"
-    rm -f "$CPU_TSV" "$MEM_TSV" "$DISK_TSV" "$LOAD1_TSV" "$LOAD5_TSV" "$LOAD15_TSV" "$SWAP_TSV" "$DISK_READ_TSV" "$DISK_WRITE_TSV" "$NET_RX_TSV" "$NET_TX_TSV" "$JOINED_TSV"
-  done
-  >&2 echo ""
+  NODE_RANGE_START_TS=$((OLDEST_BUCKET_START + VM_STEP_SECONDS))
+  NODE_RANGE_END_TS=$CURRENT_TS
+  if (( NODE_RANGE_END_TS < NODE_RANGE_START_TS )); then
+    NODE_RANGE_END_TS=$NODE_RANGE_START_TS
+  fi
+  log "Collecting cluster node metrics from VM via query_range (start=${NODE_RANGE_START_TS}, end=${NODE_RANGE_END_TS}, step=${VM_STEP_SECONDS})"
+  CPU_TSV=$(mktemp "$TMP_DIR/vm_cpu_range.tsv.XXXXXX")
+  MEM_TSV=$(mktemp "$TMP_DIR/vm_mem_range.tsv.XXXXXX")
+  DISK_TSV=$(mktemp "$TMP_DIR/vm_disk_range.tsv.XXXXXX")
+  LOAD1_TSV=$(mktemp "$TMP_DIR/vm_load1_range.tsv.XXXXXX")
+  LOAD5_TSV=$(mktemp "$TMP_DIR/vm_load5_range.tsv.XXXXXX")
+  LOAD15_TSV=$(mktemp "$TMP_DIR/vm_load15_range.tsv.XXXXXX")
+  SWAP_TSV=$(mktemp "$TMP_DIR/vm_swap_range.tsv.XXXXXX")
+  DISK_READ_TSV=$(mktemp "$TMP_DIR/vm_disk_read_range.tsv.XXXXXX")
+  DISK_WRITE_TSV=$(mktemp "$TMP_DIR/vm_disk_write_range.tsv.XXXXXX")
+  NET_RX_TSV=$(mktemp "$TMP_DIR/vm_net_rx_range.tsv.XXXXXX")
+  NET_TX_TSV=$(mktemp "$TMP_DIR/vm_net_tx_range.tsv.XXXXXX")
+  vm_fetch_range_tsv "$CLUSTER_CPU_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$CPU_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_MEM_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$MEM_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_DISK_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$DISK_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_LOAD1_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$LOAD1_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_LOAD5_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$LOAD5_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_LOAD15_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$LOAD15_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_SWAP_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$SWAP_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_DISK_READ_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$DISK_READ_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_DISK_WRITE_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$DISK_WRITE_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_NET_RX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NET_RX_TSV" "instance"
+  vm_fetch_range_tsv "$CLUSTER_NET_TX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NET_TX_TSV" "instance"
+  join_vm_range_metrics_to_csv "$NODE_CLUSTER_TIMESERIES_CSV" "$VM_STEP_SECONDS" "true" \
+    "cpu_usage_percent" "$CPU_TSV" \
+    "memory_usage_percent" "$MEM_TSV" \
+    "disk_usage_percent" "$DISK_TSV" \
+    "load_1" "$LOAD1_TSV" \
+    "load_5" "$LOAD5_TSV" \
+    "load_15" "$LOAD15_TSV" \
+    "swap_usage_percent" "$SWAP_TSV" \
+    "disk_read_mbps" "$DISK_READ_TSV" \
+    "disk_write_mbps" "$DISK_WRITE_TSV" \
+    "net_rx_mbps" "$NET_RX_TSV" \
+    "net_tx_mbps" "$NET_TX_TSV"
+  rm -f "$CPU_TSV" "$MEM_TSV" "$DISK_TSV" "$LOAD1_TSV" "$LOAD5_TSV" "$LOAD15_TSV" "$SWAP_TSV" "$DISK_READ_TSV" "$DISK_WRITE_TSV" "$NET_RX_TSV" "$NET_TX_TSV"
 else
   log "WARNING: No VM node selector provided AND failed to discover node IPs. Skipping cluster node usage timeseries"
 fi
