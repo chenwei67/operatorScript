@@ -811,6 +811,30 @@ log "Collecting table schema (CSV)"
 TABLE_SCHEMA_CSV="$OUTPUT_DIR/table_schema.csv"
 run_clickhouse_to_csv $'SELECT database, table, name AS column, type, default_kind, default_expression FROM system.columns WHERE database NOT IN (\'system\', \'information_schema\', \'INFORMATION_SCHEMA\') ORDER BY database, table, column' "$TABLE_SCHEMA_CSV"
 
+log "Collecting view and materialized view definitions (CSV)"
+VIEWS_DDL_CSV="$OUTPUT_DIR/views_ddl.csv"
+printf 'database,view,engine,create_table_query_one_line\n' >"$VIEWS_DDL_CSV"
+if ck_has_column "system" "tables" "create_table_query"; then
+  VIEWS_DDL_SQL=$(cat <<SQL
+SELECT DISTINCT
+  database,
+  name AS view,
+  engine,
+  replaceRegexpAll(create_table_query, '[\\r\\n\\t]+', ' ') AS create_table_query_one_line
+FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.tables)
+WHERE
+  database NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')
+  AND engine IN ('View', 'MaterializedView')
+ORDER BY database, view
+SQL
+)
+  if ! run_clickhouse_to_csv "$VIEWS_DDL_SQL" "$VIEWS_DDL_CSV"; then
+    log "WARNING: Failed to collect view definitions"
+  fi
+else
+  log "WARNING: system.tables.create_table_query not found; skipping view definitions"
+fi
+
 log "Collecting system.settings (CSV)"
 SYSTEM_SETTINGS_CSV="$SNAPSHOTS_DIR/system_settings.csv"
 if ! run_clickhouse_to_csv "SELECT name, value, changed, description FROM system.settings ORDER BY name" "$SYSTEM_SETTINGS_CSV"; then
@@ -822,34 +846,6 @@ SYSTEM_BUILD_OPTIONS_CSV="$SNAPSHOTS_DIR/system_build_options.csv"
 if ! run_clickhouse_to_csv "SELECT name, value FROM system.build_options ORDER BY name" "$SYSTEM_BUILD_OPTIONS_CSV"; then
   log "WARNING: Failed to collect system.build_options"
 fi
-
-# business 表写入按时间切片输出（每个表一个 CSV）
-log "Collecting business table write statistics per time column"
-# 为每个 business 表执行一次分桶统计并生成独立 CSV
-while IFS=$'\t' read -r BT_DB BT_TABLE BT_COLUMN BT_TYPE BT_FORMAT _; do
-  [[ -z "$BT_DB" || -z "$BT_TABLE" || -z "$BT_COLUMN" ]] && continue
-  DB_IDENT=$(printf '%s' "$BT_DB" | sed 's/"/""/g')
-  TABLE_IDENT=$(printf '%s' "$BT_TABLE" | sed 's/"/""/g')
-  COL_IDENT=$(printf '%s' "$BT_COLUMN" | sed 's/"/""/g')
-  TIME_EXPR=$(build_time_expression "$COL_IDENT" "$BT_TYPE" "$BT_FORMAT")
-  DB_DIR="$BUSINESS_WRITES_DIR/$(sanitize_for_filename "$BT_DB")"
-  mkdir -p "$DB_DIR"
-  TABLE_SAFE=$(sanitize_for_filename "$BT_TABLE")
-  OUT_CSV="$DB_DIR/${TABLE_SAFE}.csv"
-  log "  -> $BT_DB.$BT_TABLE -> $OUT_CSV"
-  SQL=$(cat <<SQL
-SELECT
-  toStartOfInterval($TIME_EXPR, INTERVAL {bucket_interval_minutes:Int32} MINUTE) AS start_time,
-  toStartOfInterval($TIME_EXPR, INTERVAL {bucket_interval_minutes:Int32} MINUTE) + INTERVAL {bucket_interval_minutes:Int32} MINUTE AS end_time,
-  count() AS rows
-FROM "$DB_IDENT"."$TABLE_IDENT"
-WHERE $TIME_EXPR >= now() - INTERVAL {resource_history_days:Int32} DAY
-GROUP BY start_time, end_time
-ORDER BY start_time
-SQL
-)
-  run_clickhouse_to_csv "$SQL" "$OUT_CSV"
-done <"$BUSINESS_TIME_TARGETS_FILE"
 
 # query_log 流量画像（写入 + 读取）
 log "Collecting query_log metrics for Inserts"
@@ -1394,52 +1390,7 @@ vm_query_range_to_file() {
     "$base/api/v1/query_range" >"$outfile"
 }
 
-parse_vm_disk_snapshot() {
-  local src="$1"
-  local dest="$2"
-  : >"$dest"
-  tr -d '[:space:]' <"$src" | sed 's/{"metric":/\n{"metric":/g' | sed -n 's/.*"device":"\([^"]\+\)".*"instance":"\([^"]\+\)".*"mountpoint":"\([^"]\+\)".*"value":\[[^,]\+,"\([^"]\+\)"\].*/\2\t\3\t\1\t\4/p' >>"$dest"
-  tr -d '[:space:]' <"$src" | sed 's/{"metric":/\n{"metric":/g' | sed -n 's/.*"instance":"\([^"]\+\)".*"device":"\([^"]\+\)".*"mountpoint":"\([^"]\+\)".*"value":\[[^,]\+,"\([^"]\+\)"\].*/\1\t\3\t\2\t\4/p' >>"$dest"
-}
-
-log "Collecting cluster-wide detailed disk usage from VictoriaMetrics"
-DISK_USAGE_CSV="$SNAPSHOTS_DIR/cluster_node_disk_usage.csv"
-echo "node_name,mountpoint,device,total_bytes,free_bytes,used_bytes,used_percent" > "$DISK_USAGE_CSV"
-CLUSTER_DISK_SELECTOR=""
-if [[ -n "$VM_NODE_SELECTOR" ]]; then
-  CLUSTER_DISK_SELECTOR="$VM_NODE_SELECTOR"
-elif [[ -n "$AUTO_CLUSTER_IP_REGEX" ]]; then
-  CLUSTER_DISK_SELECTOR=$(printf 'instance=~"%s"' "$AUTO_CLUSTER_IP_REGEX")
-fi
-if [[ -n "$CLUSTER_DISK_SELECTOR" ]]; then
-  DISK_FILTER=$(printf 'fstype!~"tmpfs|overlay|shm|autofs|cgroup|nsfs",%s' "$CLUSTER_DISK_SELECTOR")
-  DISK_TOTAL_PROMQL="node_filesystem_size_bytes{$DISK_FILTER}"
-  DISK_FREE_PROMQL="node_filesystem_free_bytes{$DISK_FILTER}"
-  TOTAL_JSON=$(mktemp "$TMP_DIR/disk_total.json.XXXXXX")
-  FREE_JSON=$(mktemp "$TMP_DIR/disk_free.json.XXXXXX")
-  TOTAL_TSV=$(mktemp "$TMP_DIR/disk_total.tsv.XXXXXX")
-  FREE_TSV=$(mktemp "$TMP_DIR/disk_free.tsv.XXXXXX")
-  vm_query_instant_to_file "$DISK_TOTAL_PROMQL" "" "$TOTAL_JSON"
-  vm_query_instant_to_file "$DISK_FREE_PROMQL" "" "$FREE_JSON"
-  parse_vm_disk_snapshot "$TOTAL_JSON" "$TOTAL_TSV"
-  sort -u "$TOTAL_TSV" -o "$TOTAL_TSV"
-  parse_vm_disk_snapshot "$FREE_JSON" "$FREE_TSV"
-  sort -u "$FREE_TSV" -o "$FREE_TSV"
-  awk -F'\t' -v OFS=',' '
-    FNR==NR { free[$1 SUBSEP $2 SUBSEP $3] = $4; next }
-    {
-      total = $4
-      key = $1 SUBSEP $2 SUBSEP $3
-      f_val = (key in free) ? free[key] : 0
-      used_val = total - f_val
-      used_pct = (total > 0) ? (used_val / total) * 100 : 0
-      print $1, $2, $3, total, f_val, used_val, sprintf("%.2f", used_pct)
-    }
-  ' "$FREE_TSV" "$TOTAL_TSV" >>"$DISK_USAGE_CSV"
-  rm -f "$TOTAL_JSON" "$FREE_JSON" "$TOTAL_TSV" "$FREE_TSV"
-else
-  log "WARNING: No VM node selector or auto-discovered IPs. Skipping disk usage details."
-fi
+DISK_USAGE_CSV=""
 
 # 节点静态信息与负载快照采集
 log "Collecting node hardware snapshot"
@@ -1466,7 +1417,7 @@ read -r LOAD_1 LOAD_5 LOAD_15 _ < /proc/loadavg 2>/dev/null || {
   LOAD_5=""
   LOAD_15=""
 }
-CPU_FLAGS=$(grep -oE ' (avx2|avx512f) ' /proc/cpuinfo 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,/, /g; s/^, //; s/, $//' )
+CPU_FLAGS=$(grep -ow 'avx2' /proc/cpuinfo 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,/, /g; s/^, //; s/, $//' )
 [[ -z "$CPU_FLAGS" ]] && CPU_FLAGS="none"
 SWAP_TOTAL=$(awk '/SwapTotal/ {print $2 * 1024; exit}' /proc/meminfo)
 SWAP_FREE=$(awk '/SwapFree/ {print $2 * 1024; exit}' /proc/meminfo)
@@ -1536,6 +1487,11 @@ parse_vm_matrix_response_to_prometheus() {
     gsub(/\n/, "\\n", v)
     return v
   }
+  function trim(v) {
+    gsub(/^[[:space:]]+/, "", v)
+    gsub(/[[:space:]]+$/, "", v)
+    return v
+  }
   {
     raw = raw $0
   }
@@ -1544,12 +1500,28 @@ parse_vm_matrix_response_to_prometheus() {
     n = split(raw, parts, /\{"metric":/)
     for (i = 2; i <= n; i++) {
       chunk = "{\"metric\":" parts[i]
-      if (!match(chunk, "\"" KEY_LABEL "\":\"([^\"]+)\"", m)) {
-        continue
+      label_count = split(KEY_LABEL, label_keys, ",")
+      labels = ""
+      for (k = 1; k <= label_count; k++) {
+        lk = trim(label_keys[k])
+        if (lk == "") {
+          continue
+        }
+        if (!match(chunk, "\"" lk "\":\"([^\"]+)\"", m)) {
+          labels = ""
+          break
+        }
+        lv = m[1]
+        if (STRIP_PORT == "true" && lk == "instance") {
+          sub(/:.*/, "", lv)
+        }
+        if (labels != "") {
+          labels = labels ","
+        }
+        labels = labels lk "=\"" esc(lv) "\""
       }
-      key = m[1]
-      if (STRIP_PORT == "true") {
-        sub(/:.*/, "", key)
+      if (labels == "") {
+        continue
       }
       values_pos = index(chunk, "\"values\":[")
       if (values_pos == 0) {
@@ -1569,12 +1541,12 @@ parse_vm_matrix_response_to_prometheus() {
         if (match(pts[j], /\[([0-9]+(\.[0-9]+)?),"([^"]*)"\]/, mm)) {
           ts_ms = int((mm[1] + 0) * 1000)
           v = mm[3]
-          labels = ""
+          out_labels = ""
           if (STATIC_LABELS != "") {
-            labels = labels STATIC_LABELS ","
+            out_labels = out_labels STATIC_LABELS ","
           }
-          labels = labels KEY_LABEL "=\"" esc(key) "\""
-          printf "%s{%s} %s %d\n", METRIC, labels, v, ts_ms >> DEST
+          out_labels = out_labels labels
+          printf "%s{%s} %s %d\n", METRIC, out_labels, v, ts_ms >> DEST
         }
       }
     }
@@ -1619,6 +1591,37 @@ vm_fetch_range_prometheus() {
   fi
   rm -f "$json_tmp"
 }
+
+log "Collecting business table write statistics from VictoriaMetrics (Prom format)"
+BUSINESS_STEP_SECONDS=$((BUCKET_INTERVAL_MINUTES * 60))
+if (( BUSINESS_STEP_SECONDS <= 0 )); then
+  BUSINESS_STEP_SECONDS=1800
+fi
+BUSINESS_BUCKET_COUNT=$((RESOURCE_HISTORY_MINUTES / BUCKET_INTERVAL_MINUTES))
+if (( RESOURCE_HISTORY_MINUTES % BUCKET_INTERVAL_MINUTES != 0 )); then
+  BUSINESS_BUCKET_COUNT=$((BUSINESS_BUCKET_COUNT + 1))
+fi
+(( BUSINESS_BUCKET_COUNT <= 0 )) && BUSINESS_BUCKET_COUNT=1
+BUSINESS_NOW_TS=$(date -u +%s)
+BUSINESS_CURRENT_BUCKET_END=$(( (BUSINESS_NOW_TS / BUSINESS_STEP_SECONDS) * BUSINESS_STEP_SECONDS ))
+BUSINESS_OLDEST_BUCKET_START=$((BUSINESS_CURRENT_BUCKET_END - BUSINESS_BUCKET_COUNT * BUSINESS_STEP_SECONDS))
+if (( BUSINESS_OLDEST_BUCKET_START < 0 )); then
+  BUSINESS_OLDEST_BUCKET_START=0
+fi
+BUSINESS_RANGE_START_TS=$((BUSINESS_OLDEST_BUCKET_START + BUSINESS_STEP_SECONDS))
+BUSINESS_RANGE_END_TS=$BUSINESS_CURRENT_BUCKET_END
+if (( BUSINESS_RANGE_END_TS < BUSINESS_RANGE_START_TS )); then
+  BUSINESS_RANGE_END_TS=$BUSINESS_RANGE_START_TS
+fi
+
+BUSINESS_WRITES_PROMQL=$(printf 'sum by (logType) (increase(default_key_process_count{processName="normal_ck",logType!="dynamic_graph_log"}[%sm]))' "$BUCKET_INTERVAL_MINUTES")
+BUSINESS_WRITES_PROM="$BUSINESS_WRITES_DIR/business_table_writes_timeseries.prom"
+: >"$BUSINESS_WRITES_PROM"
+STATIC_BUSINESS_LABELS=$(printf 'chi="%s",ck_cluster="%s",db="%s",processName="normal_ck"' \
+  "$(prom_escape_label_value "$CHI_NAME")" \
+  "$(prom_escape_label_value "$CK_CLUSTER_NAME")" \
+  "$(prom_escape_label_value "$CK_DATABASE_BUSINESS")")
+vm_fetch_range_prometheus "$BUSINESS_WRITES_PROMQL" "$BUSINESS_RANGE_START_TS" "$BUSINESS_RANGE_END_TS" "$BUSINESS_STEP_SECONDS" "$BUSINESS_WRITES_PROM" "logType" "sr_migration_business_table_written_rows" "false" "$STATIC_BUSINESS_LABELS"
 
 VM_STEP_SECONDS=$((VM_BUCKET_INTERVAL_MINUTES * 60))
 if (( VM_STEP_SECONDS <= 0 )); then
@@ -1789,6 +1792,31 @@ else
   log "WARNING: No VM node selector provided AND failed to discover node IPs. Skipping cluster node usage timeseries"
 fi
 
+CLUSTER_FILESYSTEM_TIMESERIES_PROM="$TIMESERIES_DIR/cluster_filesystem_usage_timeseries.prom"
+: >"$CLUSTER_FILESYSTEM_TIMESERIES_PROM"
+if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
+  log "Collecting cluster filesystem timeseries from VictoriaMetrics"
+  FS_SELECTOR=$(build_cluster_selector 'fstype!~"tmpfs|overlay|shm|autofs|cgroup|nsfs"')
+  FS_TOTAL_PROMQL=$(printf "node_filesystem_size_bytes%s" "$FS_SELECTOR")
+  FS_FREE_PROMQL=$(printf "node_filesystem_free_bytes%s" "$FS_SELECTOR")
+  FS_USED_BYTES_PROMQL=$(printf "(node_filesystem_size_bytes%s - node_filesystem_free_bytes%s)" "$FS_SELECTOR" "$FS_SELECTOR")
+  FS_USED_PCT_PROMQL=$(printf "(1 - (node_filesystem_avail_bytes%s / node_filesystem_size_bytes%s)) * 100" "$FS_SELECTOR" "$FS_SELECTOR")
+  FS_RANGE_START_TS=$((OLDEST_BUCKET_START + VM_STEP_SECONDS))
+  FS_RANGE_END_TS=$CURRENT_TS
+  if (( FS_RANGE_END_TS < FS_RANGE_START_TS )); then
+    FS_RANGE_END_TS=$FS_RANGE_START_TS
+  fi
+  STATIC_FS_LABELS=$(printf 'chi="%s",ck_cluster="%s"' \
+    "$(prom_escape_label_value "$CHI_NAME")" \
+    "$(prom_escape_label_value "$CK_CLUSTER_NAME")")
+  vm_fetch_range_prometheus "$FS_TOTAL_PROMQL" "$FS_RANGE_START_TS" "$FS_RANGE_END_TS" "$VM_STEP_SECONDS" "$CLUSTER_FILESYSTEM_TIMESERIES_PROM" "instance,mountpoint" "sr_migration_cluster_filesystem_total_bytes" "true" "$STATIC_FS_LABELS"
+  vm_fetch_range_prometheus "$FS_FREE_PROMQL" "$FS_RANGE_START_TS" "$FS_RANGE_END_TS" "$VM_STEP_SECONDS" "$CLUSTER_FILESYSTEM_TIMESERIES_PROM" "instance,mountpoint" "sr_migration_cluster_filesystem_free_bytes" "true" "$STATIC_FS_LABELS"
+  vm_fetch_range_prometheus "$FS_USED_BYTES_PROMQL" "$FS_RANGE_START_TS" "$FS_RANGE_END_TS" "$VM_STEP_SECONDS" "$CLUSTER_FILESYSTEM_TIMESERIES_PROM" "instance,mountpoint" "sr_migration_cluster_filesystem_used_bytes" "true" "$STATIC_FS_LABELS"
+  vm_fetch_range_prometheus "$FS_USED_PCT_PROMQL" "$FS_RANGE_START_TS" "$FS_RANGE_END_TS" "$VM_STEP_SECONDS" "$CLUSTER_FILESYSTEM_TIMESERIES_PROM" "instance,mountpoint" "sr_migration_cluster_filesystem_used_percent" "true" "$STATIC_FS_LABELS"
+else
+  log "WARNING: No VM node selector provided AND failed to discover node IPs. Skipping filesystem timeseries"
+fi
+
 # 汇总最终 JSON 输出
 CLUSTER_OVERVIEW_JSON=$(cat <<EOF
 {
@@ -1806,6 +1834,7 @@ TABLES_JSON=$(cat <<EOF
   "all_tables_stats_csv": $(json_string "$TABLE_STATS_CSV"),
   "all_tables_schema_csv": $(json_string "$TABLE_SCHEMA_CSV"),
   "business_ttl_csv": $(json_string "$BUSINESS_TTL_CSV"),
+  "views_ddl_csv": $(json_string "$VIEWS_DDL_CSV"),
   "business_table_writes_dir": $(json_string "$BUSINESS_WRITES_DIR")
 }
 EOF
@@ -1855,9 +1884,9 @@ NODE_LEVEL_JSON=$(cat <<EOF
   "tcp_in_use": $(json_number_or_null "$TCP_IN_USE"),
   "tcp_time_wait": $(json_number_or_null "$TCP_TIME_WAIT"),
   "storage_volumes_csv": $(json_string "$STORAGE_VOLUMES_CSV"),
-  "disk_usage_details_csv": $(json_string "$DISK_USAGE_CSV"),
   "k8s_nodes_csv": $(json_string "$K8S_NODES_CSV"),
-  "cluster_nodes_timeseries_prom": $(json_string "$NODE_CLUSTER_TIMESERIES_PROM")
+  "cluster_nodes_timeseries_prom": $(json_string "$NODE_CLUSTER_TIMESERIES_PROM"),
+  "cluster_filesystems_timeseries_prom": $(json_string "$CLUSTER_FILESYSTEM_TIMESERIES_PROM")
 }
 EOF
 )
