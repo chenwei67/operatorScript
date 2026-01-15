@@ -1097,6 +1097,96 @@ else
   QUERY_LOG_LATENCY_BY_USER_GROUP_CSV=""
 fi
 
+log "Collecting query_log failures/denials/timeouts metrics (CSV)"
+QUERY_LOG_FAILURES_CSV="$TIMESERIES_DIR/query_log_failures_timeseries.csv"
+QUERY_LOG_FAILURES_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_log_failures_timeseries_by_user_group.csv"
+echo "query_kind,start_time,end_time,queries,failures,denials,timeouts" >"$QUERY_LOG_FAILURES_CSV"
+if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
+  echo "user_group,query_kind,start_time,end_time,queries,failures,denials,timeouts" >"$QUERY_LOG_FAILURES_BY_USER_GROUP_CSV"
+else
+  QUERY_LOG_FAILURES_BY_USER_GROUP_CSV=""
+fi
+if ck_has_column "system" "query_log" "exception_code"; then
+  EXCEPTION_CODE_EXPR="exception_code"
+else
+  EXCEPTION_CODE_EXPR="0"
+fi
+if ck_has_column "system" "query_log" "exception"; then
+  EXCEPTION_TEXT_EXPR="exception"
+else
+  EXCEPTION_TEXT_EXPR="''"
+fi
+EXCEPTION_POS_FN="positionCaseInsensitive"
+EXCEPTION_MATCH_TEXT_EXPR="$EXCEPTION_TEXT_EXPR"
+if ! ck_has_function "positionCaseInsensitive"; then
+  EXCEPTION_POS_FN="position"
+  EXCEPTION_MATCH_TEXT_EXPR="lower($EXCEPTION_TEXT_EXPR)"
+fi
+QUERY_LOG_FAILURES_SQL=$(cat <<SQL
+WITH
+  ($EXCEPTION_CODE_EXPR != 0 OR $EXCEPTION_TEXT_EXPR != '' OR type != 'QueryFinish') AS is_failure,
+  ($EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'access_denied') > 0
+    OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'not allowed') > 0
+    OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'permission') > 0) AS is_denied,
+  ($EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'timeout') > 0
+    OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'timed out') > 0
+    OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'timeout exceeded') > 0) AS is_timeout
+SELECT
+  query_kind,
+  toStartOfInterval(event_time, INTERVAL {bucket_interval_minutes:Int32} MINUTE) AS start_time,
+  toStartOfInterval(event_time, INTERVAL {bucket_interval_minutes:Int32} MINUTE) + INTERVAL {bucket_interval_minutes:Int32} MINUTE AS end_time,
+  count() AS queries,
+  countIf(is_failure) AS failures,
+  countIf(is_failure AND is_denied) AS denials,
+  countIf(is_failure AND is_timeout) AS timeouts
+FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log)
+WHERE
+  event_time >= now() - INTERVAL {resource_history_days:Int32} DAY
+  AND type IN ('QueryFinish', 'ExceptionBeforeStart', 'ExceptionWhileProcessing')
+  AND is_initial_query = 1
+  AND query_kind IN ('Select', 'Insert')
+  AND has(databases, {CK_DATABASE_BUSINESS:String})
+GROUP BY query_kind, start_time, end_time
+ORDER BY query_kind, start_time
+SQL
+)
+if ! run_clickhouse_to_csv "$QUERY_LOG_FAILURES_SQL" "$QUERY_LOG_FAILURES_CSV"; then
+  log "WARNING: Failed to collect query_log failure metrics"
+fi
+if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
+  if ! run_clickhouse_to_csv "$(cat <<SQL
+WITH
+  ($EXCEPTION_CODE_EXPR != 0 OR $EXCEPTION_TEXT_EXPR != '' OR type != 'QueryFinish') AS is_failure,
+  ($EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'access_denied') > 0
+    OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'not allowed') > 0
+    OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'permission') > 0) AS is_denied,
+  ($EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'timeout') > 0
+    OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'timed out') > 0
+    OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'timeout exceeded') > 0) AS is_timeout
+SELECT
+  if($QUERY_LOG_USER_COLUMN = 'root', 'root', '__NON_ROOT__') AS user_group,
+  query_kind,
+  toStartOfInterval(event_time, INTERVAL {bucket_interval_minutes:Int32} MINUTE) AS start_time,
+  toStartOfInterval(event_time, INTERVAL {bucket_interval_minutes:Int32} MINUTE) + INTERVAL {bucket_interval_minutes:Int32} MINUTE AS end_time,
+  count() AS queries,
+  countIf(is_failure) AS failures,
+  countIf(is_failure AND is_denied) AS denials,
+  countIf(is_failure AND is_timeout) AS timeouts
+FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log)
+WHERE
+  event_time >= now() - INTERVAL {resource_history_days:Int32} DAY
+  AND type IN ('QueryFinish', 'ExceptionBeforeStart', 'ExceptionWhileProcessing')
+  AND is_initial_query = 1
+  AND query_kind IN ('Select', 'Insert')
+  AND has(databases, {CK_DATABASE_BUSINESS:String})
+GROUP BY user_group, query_kind, start_time, end_time
+ORDER BY user_group, query_kind, start_time
+SQL
+)" "$QUERY_LOG_FAILURES_BY_USER_GROUP_CSV"; then
+    log "WARNING: Failed to collect query_log failure metrics by user group"
+  fi
+fi
+
 log "Collecting top slow queries in last 30 days (CSV)"
 SLOW_QUERIES_CSV="$OUTPUT_DIR/slow_queries_top.csv"
 echo "query_kind,normalized_query,queries,p95_query_duration_ms,avg_query_duration_ms,sum_read_bytes,max_memory_usage_bytes" >"$SLOW_QUERIES_CSV"
@@ -1855,6 +1945,11 @@ vm_fetch_range_prometheus() {
   local json_tmp
   json_tmp=$(mktemp "$TMP_DIR/vm_range_json.XXXXXX")
   if vm_query_range_to_file "$promql" "$start_ts" "$end_ts" "$step_seconds" "$json_tmp"; then
+    if grep -q '"result":\[\]' "$json_tmp" || grep -q '"result":\\[\\]' "$json_tmp"; then
+      log "WARNING: VM query_range returned empty result for $metric_name"
+      rm -f "$json_tmp"
+      return 0
+    fi
     parse_vm_matrix_response_to_prometheus "$json_tmp" "$dest_prom" "$key_label" "$metric_name" "$strip_port" "$static_labels"
   fi
   rm -f "$json_tmp"
@@ -1971,6 +2066,77 @@ vm_fetch_range_prometheus "$CK_POD_DISK_W_MAX_PROMQL" "$POD_RANGE_START_TS" "$PO
 vm_fetch_range_prometheus "$CK_POD_THROTTLE_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_cpu_throttle_percent_avg" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_THROTTLE_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_cpu_throttle_percent_max" "false" "$STATIC_POD_LABELS"
 
+CK_METRICS_TIMESERIES_PROM="$TIMESERIES_DIR/clickhouse_metrics_timeseries.prom"
+: >"$CK_METRICS_TIMESERIES_PROM"
+CK_METRICS_EXTRA_MATCHERS=""
+if [[ -n "$VM_CK_POD_SELECTOR" ]]; then
+  CK_METRICS_EXTRA_MATCHERS=",$VM_CK_POD_SELECTOR"
+fi
+STATIC_CK_METRICS_LABELS=$(printf 'chi="%s",ck_cluster="%s",namespace="%s"' \
+  "$(prom_escape_label_value "$CHI_NAME")" \
+  "$(prom_escape_label_value "$CK_CLUSTER_NAME")" \
+  "$(prom_escape_label_value "$CK_K8S_NAMESPACE")")
+CK_MERGES_SELECTOR=$(printf '{__name__=~"^(ClickHouseMetrics_Merges|ClickHouseMetrics_Merge)$"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_QUERIES_SELECTOR=$(printf '{__name__=~"^(ClickHouseMetrics_Queries|ClickHouseMetrics_Query)$"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_GLOBAL_THREADS_ACTIVE_SELECTOR=$(printf '{__name__="ClickHouseMetrics_GlobalThreadActive"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_PARTS_ACTIVE_SELECTOR=$(printf '{__name__="ClickHouseMetrics_PartsActive"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_MEMORY_TRACKING_SELECTOR=$(printf '{__name__="ClickHouseMetrics_MemoryTracking"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_TCP_CONNECTION_SELECTOR=$(printf '{__name__="ClickHouseMetrics_TCPConnection"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_HTTP_CONNECTION_SELECTOR=$(printf '{__name__="ClickHouseMetrics_HTTPConnection"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_MYSQL_CONNECTION_SELECTOR=$(printf '{__name__="ClickHouseMetrics_MySQLConnection"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_PG_CONNECTION_SELECTOR=$(printf '{__name__="ClickHouseMetrics_PostgreSQLConnection"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_INTERSERVER_CONNECTION_SELECTOR=$(printf '{__name__="ClickHouseMetrics_InterserverConnection"%s}' "$CK_METRICS_EXTRA_MATCHERS")
+CK_MERGES_BASE=$(printf 'sum by (instance) (%s)' "$CK_MERGES_SELECTOR")
+CK_PARTS_ACTIVE_BASE=$(printf 'sum by (instance) (%s)' "$CK_PARTS_ACTIVE_SELECTOR")
+CK_QUERIES_BASE=$(printf 'sum by (instance) (%s)' "$CK_QUERIES_SELECTOR")
+CK_GLOBAL_THREADS_ACTIVE_BASE=$(printf 'sum by (instance) (%s)' "$CK_GLOBAL_THREADS_ACTIVE_SELECTOR")
+CK_MEMORY_TRACKING_BASE=$(printf 'sum by (instance) (%s)' "$CK_MEMORY_TRACKING_SELECTOR")
+CK_TCP_CONNECTION_BASE=$(printf 'sum by (instance) (%s)' "$CK_TCP_CONNECTION_SELECTOR")
+CK_HTTP_CONNECTION_BASE=$(printf 'sum by (instance) (%s)' "$CK_HTTP_CONNECTION_SELECTOR")
+CK_MYSQL_CONNECTION_BASE=$(printf 'sum by (instance) (%s)' "$CK_MYSQL_CONNECTION_SELECTOR")
+CK_PG_CONNECTION_BASE=$(printf 'sum by (instance) (%s)' "$CK_PG_CONNECTION_SELECTOR")
+CK_INTERSERVER_CONNECTION_BASE=$(printf 'sum by (instance) (%s)' "$CK_INTERSERVER_CONNECTION_SELECTOR")
+CK_MERGES_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_MERGES_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_MERGES_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_MERGES_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_PARTS_ACTIVE_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_PARTS_ACTIVE_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_PARTS_ACTIVE_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_PARTS_ACTIVE_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_QUERIES_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_QUERIES_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_QUERIES_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_QUERIES_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_GLOBAL_THREADS_ACTIVE_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_GLOBAL_THREADS_ACTIVE_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_GLOBAL_THREADS_ACTIVE_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_GLOBAL_THREADS_ACTIVE_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_MEMORY_TRACKING_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_MEMORY_TRACKING_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_MEMORY_TRACKING_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_MEMORY_TRACKING_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_TCP_CONNECTION_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_TCP_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_TCP_CONNECTION_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_TCP_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_HTTP_CONNECTION_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_HTTP_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_HTTP_CONNECTION_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_HTTP_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_MYSQL_CONNECTION_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_MYSQL_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_MYSQL_CONNECTION_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_MYSQL_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_PG_CONNECTION_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_PG_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_PG_CONNECTION_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_PG_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_INTERSERVER_CONNECTION_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CK_INTERSERVER_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_INTERSERVER_CONNECTION_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_INTERSERVER_CONNECTION_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+vm_fetch_range_prometheus "$CK_MERGES_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_merges_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_MERGES_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_merges_max" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_PARTS_ACTIVE_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_parts_active_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_PARTS_ACTIVE_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_parts_active_max" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_QUERIES_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_queries_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_QUERIES_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_queries_max" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_GLOBAL_THREADS_ACTIVE_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_global_threads_active_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_GLOBAL_THREADS_ACTIVE_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_global_threads_active_max" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_MEMORY_TRACKING_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_memory_tracking_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_MEMORY_TRACKING_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_memory_tracking_max" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_TCP_CONNECTION_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_tcp_connections_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_TCP_CONNECTION_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_tcp_connections_max" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_HTTP_CONNECTION_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_http_connections_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_HTTP_CONNECTION_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_http_connections_max" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_MYSQL_CONNECTION_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_mysql_connections_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_MYSQL_CONNECTION_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_mysql_connections_max" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_PG_CONNECTION_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_postgresql_connections_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_PG_CONNECTION_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_postgresql_connections_max" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_INTERSERVER_CONNECTION_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_interserver_connections_avg" "true" "$STATIC_CK_METRICS_LABELS"
+vm_fetch_range_prometheus "$CK_INTERSERVER_CONNECTION_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_interserver_connections_max" "true" "$STATIC_CK_METRICS_LABELS"
+
 # 集群所有节点资源分时序列（来自 VM）
 NODE_CLUSTER_TIMESERIES_PROM="$TIMESERIES_DIR/cluster_node_usage_timeseries.prom"
 : >"$NODE_CLUSTER_TIMESERIES_PROM"
@@ -2001,6 +2167,11 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   CLUSTER_SWAP_BASE=$(printf "(1 - (node_memory_SwapFree_bytes%s / clamp_min(node_memory_SwapTotal_bytes%s,1))) * 100" "$CLUSTER_MEM_SELECTOR" "$CLUSTER_MEM_SELECTOR")
   CLUSTER_DISK_READ_BASE=$(printf "(sum by (instance) (rate(node_disk_read_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_DISK_WRITE_BASE=$(printf "(sum by (instance) (rate(node_disk_written_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_AWAIT_BASE=$(printf "(1000 * (sum by (instance) (rate(node_disk_read_time_seconds_total%s[%s])) + sum by (instance) (rate(node_disk_write_time_seconds_total%s[%s]))) / clamp_min((sum by (instance) (rate(node_disk_reads_completed_total%s[%s])) + sum by (instance) (rate(node_disk_writes_completed_total%s[%s]))), 0.001))" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_NET_RX_BASE=$(printf "(sum by (instance) (rate(node_network_receive_bytes_total%s[%s])) / 1000000)" "$CLUSTER_NET_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_NET_TX_BASE=$(printf "(sum by (instance) (rate(node_network_transmit_bytes_total%s[%s])) / 1000000)" "$CLUSTER_NET_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_CPU_AVG_PROMQL=$(printf "sum by (instance) (rate(node_cpu_seconds_total%s[%s])) * 100" "$CLUSTER_CPU_SELECTOR" "$VM_BUCKET_WINDOW")
@@ -2021,6 +2192,12 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   CLUSTER_DISK_READ_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_READ_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
   CLUSTER_DISK_WRITE_AVG_PROMQL=$(printf "(sum by (instance) (rate(node_disk_written_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_DISK_WRITE_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_WRITE_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_AWAIT_AVG_PROMQL=$(printf "(1000 * (sum by (instance) (rate(node_disk_read_time_seconds_total%s[%s])) + sum by (instance) (rate(node_disk_write_time_seconds_total%s[%s]))) / clamp_min((sum by (instance) (rate(node_disk_reads_completed_total%s[%s])) + sum by (instance) (rate(node_disk_writes_completed_total%s[%s]))), 0.001))" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
+  CLUSTER_DISK_AWAIT_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_AWAIT_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
   CLUSTER_NET_RX_AVG_PROMQL=$(printf "(sum by (instance) (rate(node_network_receive_bytes_total%s[%s])) / 1000000)" "$CLUSTER_NET_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_NET_RX_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_NET_RX_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
   CLUSTER_NET_TX_AVG_PROMQL=$(printf "(sum by (instance) (rate(node_network_transmit_bytes_total%s[%s])) / 1000000)" "$CLUSTER_NET_SELECTOR" "$VM_BUCKET_WINDOW")
@@ -2052,6 +2229,8 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   vm_fetch_range_prometheus "$CLUSTER_DISK_READ_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_read_mbps_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_write_mbps_avg" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_write_mbps_max" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_AWAIT_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_await_ms_avg" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_AWAIT_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_await_ms_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_NET_RX_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_net_rx_mbps_avg" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_NET_RX_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_net_rx_mbps_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_NET_TX_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_net_tx_mbps_avg" "true" "$STATIC_NODE_LABELS"
@@ -2115,6 +2294,9 @@ SCHEMAS_JSON=$(cat <<EOF
 EOF
 )
 
+: "${BUSINESS_QUERY_LOG_WRITES_DIR:=}"
+: "${QUERY_LOG_WRITTEN_BYTES_CSV:=}"
+
 TRAFFIC_JSON=$(cat <<EOF
 {
   "business_table_writes_dir": $(json_string "$BUSINESS_WRITES_DIR"),
@@ -2124,6 +2306,8 @@ TRAFFIC_JSON=$(cat <<EOF
     "reads_by_user_group_csv": $(json_string "$BUSINESS_QUERY_LOG_READS_BY_USER_GROUP_CSV")
   },
   # "query_log_written_bytes_timeseries_csv": $(json_string "$QUERY_LOG_WRITTEN_BYTES_CSV"),
+  "query_log_failures_timeseries_csv": $(json_string "$QUERY_LOG_FAILURES_CSV"),
+  "query_log_failures_timeseries_by_user_group_csv": $(json_string "$QUERY_LOG_FAILURES_BY_USER_GROUP_CSV"),
   "query_log_latency_timeseries_by_user_group_csv": $(json_string "$QUERY_LOG_LATENCY_BY_USER_GROUP_CSV"),
   "slow_queries_csv": $(json_string "$SLOW_QUERIES_CSV"),
   "slow_queries_by_user_group_csv": $(json_string "$SLOW_QUERIES_BY_USER_GROUP_CSV"),
@@ -2165,7 +2349,8 @@ EOF
 
 CK_LEVEL_JSON=$(cat <<EOF
 {
-  "pod_usage_timeseries_prom": $(json_string "$CK_POD_TIMESERIES_PROM")
+  "pod_usage_timeseries_prom": $(json_string "$CK_POD_TIMESERIES_PROM"),
+  "clickhouse_metrics_timeseries_prom": $(json_string "$CK_METRICS_TIMESERIES_PROM")
 }
 EOF
 )
@@ -2200,6 +2385,169 @@ EOF
 OUTPUT_FILE="$OUTPUT_DIR/migration_metrics.json"
 printf '%s\n' "$FINAL_JSON" >"$OUTPUT_FILE"
 log "Collection finished. JSON summary saved to $OUTPUT_FILE"
+
+file_has_real_data() {
+  local file_path="$1"
+  local ext=""
+  ext="${file_path##*.}"
+
+  case "$ext" in
+    csv|tsv)
+      awk 'NR==1{next} $0 !~ /^[ \t\r]*$/ {found=1; exit} END{exit found?0:1}' "$file_path"
+      ;;
+    prom)
+      grep -qvE '^[[:space:]]*(#.*)?$' "$file_path"
+      ;;
+    yaml|yml)
+      grep -qvE '^[[:space:]]*(#.*)?$|^[[:space:]]*(null|\{\}|\[\])[[:space:]]*$' "$file_path"
+      ;;
+    json)
+      grep -qvE '^[[:space:]]*$|^[[:space:]]*(null|\{\}|\[\])[[:space:]]*$' "$file_path"
+      ;;
+    *)
+      grep -qvE '^[[:space:]]*$' "$file_path"
+      ;;
+  esac
+}
+
+validate_exported_files_have_data() {
+  local root_dir="$1"
+  local report_file="$2"
+  local report_basename
+  report_basename="$(basename "$report_file")"
+  local prom_metrics_report_file="$root_dir/prom_metrics_status.tsv"
+  local prom_metrics_report_basename
+  prom_metrics_report_basename="$(basename "$prom_metrics_report_file")"
+
+  local total_files=0
+  local data_files=0
+  local empty_files=0
+  local no_data_files=0
+  local listed=0
+  local max_listed=500
+  local prom_metric_total=0
+  local prom_metric_has_data=0
+  local prom_metric_no_data=0
+
+  {
+    echo "export_data_validation_report"
+    echo "root_dir=$root_dir"
+    echo "generated_at_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    echo
+    echo -e "status\trelative_path\tbytes"
+  } >"$report_file"
+
+  printf "relative_path\tmetric\tstatus\tsample_lines\n" >"$prom_metrics_report_file"
+
+  while IFS= read -r -d '' file_path; do
+    total_files=$((total_files + 1))
+    local rel_path bytes
+    rel_path="${file_path#"$root_dir"/}"
+    bytes=$(wc -c <"$file_path" | tr -d '[:space:]' || echo "0")
+
+    if [[ ! -s "$file_path" ]]; then
+      empty_files=$((empty_files + 1))
+      if (( listed < max_listed )); then
+        printf "EMPTY\t%s\t%s\n" "$rel_path" "$bytes" >>"$report_file"
+        listed=$((listed + 1))
+      fi
+      continue
+    fi
+
+    if [[ "${file_path##*.}" == "prom" ]]; then
+      while IFS=$'\t' read -r metric status sample_lines; do
+        [[ -z "$metric" ]] && continue
+        printf "%s\t%s\t%s\t%s\n" "$rel_path" "$metric" "$status" "$sample_lines" >>"$prom_metrics_report_file"
+        prom_metric_total=$((prom_metric_total + 1))
+        if [[ "$status" == "HAS_DATA" ]]; then
+          prom_metric_has_data=$((prom_metric_has_data + 1))
+        else
+          prom_metric_no_data=$((prom_metric_no_data + 1))
+        fi
+      done < <(
+        awk '
+          function metric_name(tok,    p) {
+            p = index(tok, "{")
+            if (p > 0) return substr(tok, 1, p - 1)
+            return tok
+          }
+          /^#[[:space:]]*(HELP|TYPE)[[:space:]]+[A-Za-z_:][A-Za-z0-9_:]*/ {
+            m = $3
+            declared[m] = 1
+            next
+          }
+          /^[[:space:]]*#/ { next }
+          /^[[:space:]]*$/ { next }
+          {
+            m = metric_name($1)
+            if (m != "") samples[m]++
+          }
+          END {
+            for (m in declared) all[m] = 1
+            for (m in samples) all[m] = 1
+            for (m in all) {
+              c = samples[m] + 0
+              if (c > 0) printf "%s\tHAS_DATA\t%d\n", m, c
+              else printf "%s\tNO_DATA\t0\n", m
+            }
+          }
+        ' "$file_path" | LC_ALL=C sort
+      )
+    fi
+
+    if file_has_real_data "$file_path"; then
+      data_files=$((data_files + 1))
+    else
+      no_data_files=$((no_data_files + 1))
+      if (( listed < max_listed )); then
+        printf "NO_DATA\t%s\t%s\n" "$rel_path" "$bytes" >>"$report_file"
+        listed=$((listed + 1))
+      fi
+    fi
+  done < <(
+    find "$root_dir" -type f \
+      ! -name "$report_basename" \
+      ! -name "$prom_metrics_report_basename" \
+      ! -name "migration_metrics.json" \
+      -print0
+  )
+
+  {
+    echo
+    echo "summary_total_files=$total_files"
+    echo "summary_data_files=$data_files"
+    echo "summary_empty_files=$empty_files"
+    echo "summary_no_data_files=$no_data_files"
+    echo "summary_prom_metrics_report=$(printf '%s' "$prom_metrics_report_file")"
+    echo "summary_prom_metric_total=$prom_metric_total"
+    echo "summary_prom_metric_has_data=$prom_metric_has_data"
+    echo "summary_prom_metric_no_data=$prom_metric_no_data"
+    if (( (empty_files + no_data_files) > listed )); then
+      echo "summary_list_truncated=true"
+      echo "summary_list_limit=$max_listed"
+    else
+      echo "summary_list_truncated=false"
+    fi
+  } >>"$report_file"
+
+  if (( prom_metric_total > 0 )); then
+    {
+      echo
+      echo "prom_metrics_status_begin"
+      cat "$prom_metrics_report_file"
+      echo "prom_metrics_status_end"
+    } >>"$report_file"
+  fi
+
+  log "Export validation done. total=$total_files data=$data_files empty=$empty_files no_data=$no_data_files report=$report_file"
+  if (( empty_files > 0 || no_data_files > 0 )); then
+    log "WARNING: Some exported files look empty/header-only. See $report_file"
+  fi
+}
+
+DATA_VALIDATION_REPORT="$OUTPUT_DIR/export_data_validation_report.txt"
+log "Validating exported files contain real data"
+validate_exported_files_have_data "$OUTPUT_DIR" "$DATA_VALIDATION_REPORT"
 
 if [[ "$COMPRESS_OUTPUT" == "true" ]]; then
   ARCHIVE_NAME="${OUTPUT_DIR}.tar.gz"

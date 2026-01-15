@@ -1,5 +1,7 @@
 # collect.sh 指标采集清单（CK -> SR 迁移）
 
+此脚本目的是提前获取迁移过程前的预检和过程中的反压数据来源
+
 默认输出目录：
 
 - `OUTPUT_DIR` 未指定时为 `$(pwd)/output`（见脚本参数处理逻辑）
@@ -20,75 +22,76 @@
 
 ## 二、集群规模与硬件信息
 
-| 采集内容/指标                                 | 统计方式或公式（脚本口径）                                                                                                                                                                                                                       | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段）                                                                       | 压力风险                | 在 CK -> SR 迁移中的作用                                                                       |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------- |
-| 集群节点数                                    | `kubectl get nodes --no-headers \| wc -l`                                                                                                                                                                                                       | `migration_metrics.json.cluster_overview.cluster_node_count`                                                      | 低                      | 迁移容量与规模评估的“最基础”输入（SR 侧节点规模、分片规划、并发迁移度）                      |
-| CHI 分片/副本与期望节点数                     | 从 `kubectl get chi ... jsonpath` 取 `shardsCount/replicasCount`，并计算 `shards*replicas`                                                                                                                                                 | `migration_metrics.json.cluster_overview.chi_shards_count` / `chi_replicas_count` / `chi_expected_node_count` | 低                      | 还原 CK 当前集群拓扑，为 SR 侧分片与副本设计提供对照基线                                       |
-| K8s 节点硬件清单（核数/内存）                 | `kubectl get nodes -o jsonpath ...` 导出 `cpu_capacity/memory_capacity` 及 allocatable                                                                                                                                                       | `snapshots/cluster_k8s_nodes.csv`                                                                                 | 低                      | 清晰看到“有多少节点、每个节点多少核/多少内存”，用于 SR 侧硬件等价或扩缩容计算                |
-| K8s 节点磁盘容量与使用量（来自 VM）           | VictoriaMetrics `api/v1/query` 拉 `node_filesystem_size_bytes/free_bytes`，按 node+mountpoint 计算 `used_bytes/used_percent`（过滤 tmpfs/overlay 等）                                                                                      | `snapshots/cluster_node_disk_usage.csv`                                                                           | 低（对 CK）/中（对 VM） | 获得全节点磁盘水位（容量/使用率），用于 SR 容量规划、迁移窗口风险评估与限流策略                |
-| 执行节点硬件快照（CPU 核数/内存/磁盘/负载等） | 从 `/proc/meminfo`、`/proc/loadavg`、`/proc/cpuinfo`、`df`、`/proc/sys/fs/file-nr`、`/proc/net/sockstat` 采集：`cpu_cores/memory_total_bytes/memory_used_bytes/disk_total_bytes/disk_used_bytes/load_avg/cpu_flags/swap/fd/tcp` 等 | `migration_metrics.json.resources.node_level.*`                                                                   | 低                      | 采集脚本运行环境的资源水位（是否 CPU/内存/FD/连接紧张），辅助判断迁移/采集本身的可执行性与风险 |
+对最终方案制定：用于 SR 侧容量规划（节点数、CPU/内存配比、存储盘型与容量预留）、分片/副本规划与迁移并发上限估算；同时以 CK 当前拓扑为“对照基线”，决定是否需要先扩容 SR 或调整分布策略。
+
+迁移前预检：检查现网磁盘水位、节点规格是否有足够冗余承受“迁移+双写/同步”叠加负载
+
+迁移中反压：把 CPU/内存/磁盘水位与负载作为限流信号，动态控制全量导入/增量同步的并发、批大小与速率，避免把压力传导到 CK 或 SR 造成雪崩。
+
+| 采集内容/指标                                 | 统计方式或公式（脚本口径）                                                                                                                                                                                                                       | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段）                                                                       | 压力风险                |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| 集群节点数                                    | `kubectl get nodes --no-headers \| wc -l`                                                                                                                                                                                                       | `migration_metrics.json.cluster_overview.cluster_node_count`                                                      | 低                      |
+| CHI 分片/副本与期望节点数                     | 从 `kubectl get chi ... jsonpath` 取 `shardsCount/replicasCount`，并计算 `shards*replicas`                                                                                                                                                 | `migration_metrics.json.cluster_overview.chi_shards_count` / `chi_replicas_count` / `chi_expected_node_count` | 低                      |
+| K8s 节点硬件清单（核数/内存）                 | `kubectl get nodes -o jsonpath ...` 导出 `cpu_capacity/memory_capacity` 及 allocatable                                                                                                                                                       | `snapshots/cluster_k8s_nodes.csv`                                                                                 | 低                      |
+| K8s 节点磁盘容量与使用量（来自 VM）           | VictoriaMetrics `api/v1/query` 拉 `node_filesystem_size_bytes/free_bytes`，按 node+mountpoint 计算 `used_bytes/used_percent`（过滤 tmpfs/overlay 等）                                                                                      | `snapshots/cluster_node_disk_usage.csv`                                                                           | 低（对 CK）/中（对 VM） |
+| 执行节点硬件快照（CPU 核数/内存/磁盘/负载等） | 从 `/proc/meminfo`、`/proc/loadavg`、`/proc/cpuinfo`、`df`、`/proc/sys/fs/file-nr`、`/proc/net/sockstat` 采集：`cpu_cores/memory_total_bytes/memory_used_bytes/disk_total_bytes/disk_used_bytes/load_avg/cpu_flags/swap/fd/tcp` 等 | `migration_metrics.json.resources.node_level.*`                                                                   | 低                      |
 
 ## 三、部署与配置（可复现性/对齐）
 
-| 采集内容/指标            | 统计方式或公式（脚本口径）                                                   | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段）          | 压力风险 | 在 CK -> SR 迁移中的作用                                                   |
-| ------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------ | -------- | -------------------------------------------------------------------------- |
-| Helm release 用户 values | `helm list` 后对每个 release 执行 `helm get values`                      | `helm/<release>.yaml`                                | 低       | 还原线上部署参数（资源、存储、镜像、配置），用于 SR 侧对齐部署与排障复现   |
-| ClickHouse 版本          | `SELECT version()`                                                         | `migration_metrics.json.cluster_overview.ck_version` | 低       | 不同 CK 版本 system 表字段/函数不同，影响 query_log 采集口径与迁移兼容策略 |
-| system.settings          | `SELECT name,value,changed,description FROM system.settings ORDER BY name` | `snapshots/system_settings.csv`                      | 低       | 参数基线对照（并发、合并、内存等），迁移到 SR 后用于等价调参或差异解释     |
-| system.build_options     | `SELECT name,value FROM system.build_options ORDER BY name`                | `snapshots/system_build_options.csv`                 | 低       | 编译特性差异可能导致行为不同，便于迁移后问题定位                           |
+对最终方案制定：把 CK 现网的部署参数与关键配置“固化”为可对照的基线，用于决定 SR 侧部署形态（K8s/资源配额/存储类/副本）、以及迁移期间是否需要对 CK/SR 做特定调参以支撑双写或同步。
+
+| 采集内容/指标            | 统计方式或公式（脚本口径）                                                   | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段）          | 压力风险 |
+| ------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------ | -------- |
+| Helm release 用户 values | `helm list` 后对每个 release 执行 `helm get values`                      | `helm/<release>.yaml`                                | 低       |
+| ClickHouse 版本          | `SELECT version()`                                                         | `migration_metrics.json.cluster_overview.ck_version` | 低       |
+| system.settings          | `SELECT name,value,changed,description FROM system.settings ORDER BY name` | `snapshots/system_settings.csv`                      | 低       |
+| system.build_options     | `SELECT name,value FROM system.build_options ORDER BY name`                | `snapshots/system_build_options.csv`                 | 低       |
 
 ## 四、表结构与数据体量
 
-| 采集内容/指标                    | 统计方式或公式（脚本口径）                                                                                                                                                   | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段） | 压力风险 | 在 CK -> SR 迁移中的作用                                    |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- | -------- | ----------------------------------------------------------- |
-| 全量表统计（行数/压缩/解压大小） | `clusterAllReplicas(system.tables)` 取表清单；LEFT JOIN `clusterAllReplicas(system.parts)`（限定 replica_num=1）聚合 `sum(rows/bytes_on_disk/data_uncompressed_bytes)` | `table_stats.csv`                           | 中       | 盘点迁移规模与热点大表，决定分批迁移顺序、SR 容量与分片规划 |
-| 全量表 schema（列级）            | `system.columns` 导出 `database/table/column/type/default_*`                                                                                                             | `table_schema.csv`                          | 低-中    | SR 侧建表/校验 schema 兼容性（类型/默认值/表达式差异）      |
-| business 表 TTL 元数据           | 从 `system.tables.engine_full` 提取 TTL 表达式与 TTL 数值                                                                                                                  | `business_ttl.csv`                          | 低       | 迁移后保持（或优化）数据保留策略，避免存储成本失控          |
+对最终方案制定：用表级规模与 schema 兼容性决定迁移分批顺序（先小后大/先冷后热/先非关键后关键）、SR 分桶/分区策略与副本规划；同时为双写与 CK->SR 同步选择“哪些表先纳入、哪些表延后”提供量化依据。
 
-## 五、后台任务与存储状态快照
+| 采集内容/指标                    | 统计方式或公式（脚本口径）                                                                                                                                                   | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段） | 压力风险 |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- | -------- |
+| 全量表统计（行数/压缩/解压大小） | `clusterAllReplicas(system.tables)` 取表清单；LEFT JOIN `clusterAllReplicas(system.parts)`（限定 replica_num=1）聚合 `sum(rows/bytes_on_disk/data_uncompressed_bytes)` | `table_stats.csv`                           | 中       |
+| 全量表 schema（列级）            | `system.columns` 导出 `database/table/column/type/default_*`                                                                                                             | `table_schema.csv`                          | 低-中    |
+| business 表 TTL 元数据           | 从 `system.tables.engine_full` 提取 TTL 表达式与 TTL 数值                                                                                                                  | `business_ttl.csv`                          | 低       |
 
-| 采集内容/指标                             | 统计方式或公式（脚本口径）                                                                                                                | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段） | 压力风险 | 在 CK -> SR 迁移中的作用                                                   |
-| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- | -------- | -------------------------------------------------------------------------- |
-| parts/partitions 压力快照                 | `clusterAllReplicas(system.parts)`（限定 replica_num=1）按表聚合：`active_parts/uniqExact(partition)/sum(rows,bytes)/max(part_bytes)` | `snapshots/cluster_parts_snapshot.csv`      | 中       | 评估碎片度与合并风险；parts 过多通常意味着迁移时更容易抖动，需要更温和节奏 |
-| merges 快照                               | `clusterAllReplicas(system.merges)` 按节点聚合：`count()/sum(num_parts)/sum(total_size_bytes_compressed)`                             | `snapshots/cluster_merges_snapshot.csv`     | 低-中    | 判断后台 merge 是否拥堵，迁移窗口尽量避开合并高压时段                      |
-| mutations 快照                            | `clusterAllReplicas(system.mutations)` 过滤 `is_done=0` 按表聚合                                                                      | `snapshots/cluster_mutations_snapshot.csv`  | 低-中    | 识别未完成 mutation，避免迁移过程中数据状态不一致                          |
-| ClickHouse 集群存储卷信息（system.disks） | `clusterAllReplicas(system.disks)` 输出 disk/path/total/free/keep_free_space                                                            | `snapshots/cluster_storage_volumes.csv`     | 低       | 了解现网存储卷布局与容量，为 SR 存储拓扑与容量预留提供依据                 |
+## 五、流量与查询画像
 
-## 六、流量与查询画像（最影响迁移体验与 SR 压测目标）
+对最终方案制定：识别日业务低峰时段，决定同步数据时段和并发、批次；识别热点表，人查与机查模式，并决定T0查询时间范围评估。
 
-| 采集内容/指标                              | 统计方式或公式（脚本口径）                                                                                                                                                                     | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段）          | 压力风险 | 在 CK -> SR 迁移中的作用                                             |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | -------- | -------------------------------------------------------------------- |
-| business 表写入行数分桶（逐表）            | 对 business-time-config 中每张表：`WHERE time_expr >= now()-N day`，按 `toStartOfInterval(time_expr, bucket)` 聚合 `count()`                                                             | `timeseries/business_table_writes/<db>/<table>.csv`  | 高       | 直接得到每表写入量的时序基线，决定 SR 写入容量/迁移切流窗口/限流策略 |
-| query_log Insert 按表分桶（次数/写入行数） | `clusterAllReplicas(system.query_log)` + `ARRAY JOIN arrayEnumerate(databases)`，过滤 `QueryFinish/is_initial_query/query_kind=Insert`，按表+桶聚合 `count()` 与 `sum(written_rows)` | `timeseries/query_log_writes/`（目录内拆分为多文件） | 中-高    | 从请求侧刻画写入模式，校验业务表扫描结果，作为 SR 写入链路压测目标   |
-| query_log Select 按表分桶（次数）          | 同上，过滤 `query_kind=Select`，按表+桶聚合 `count()`                                                                                                                                      | `timeseries/query_log_reads/`（目录内拆分为多文件）  | 中-高    | 读请求热点画像，指导 SR 索引/缓存/资源倾斜与迁移后体验基线           |
-| query_log written_bytes 时序（含回退口径） | 优先聚合 `system.query_log.written_bytes`；否则回退 `system.part_log` NewPart；再回退 `system.parts` modification_time 近似                                                              | `timeseries/query_log_written_bytes_timeseries.csv`  | 中       | 写入带宽与落盘压力评估，为 SR 存储 IO 与写入吞吐规划提供量化输入     |
-| query_log 延迟画像（p50/p95/p99/avg）      | `clusterAllReplicas(system.query_log)` 按 `query_kind+时间桶` 聚合 `quantile/avg/sum(read_bytes)/max(memory_usage)`                                                                      | `timeseries/query_log_latency_timeseries.csv`        | 高       | 迁移前体验基线，迁移后可直接对比 SR 的延迟是否退化/改善              |
-| Top 慢查询（按 normalized_query 聚合）     | `GROUP BY normalized_query` 聚合 `count/p95/avg/sum(read_bytes)/max(memory_usage)`，按 p95 降序取 TopN                                                                                     | `slow_queries_top.csv`                               | 高       | 找到最该优先优化的查询模式                                           |
-| 查询时间范围分布（按表，正则解析 SQL）     | 扫 `system.query_log`，对 `ql.query` 做多类正则解析估算范围天数，按表统计比例与分位；带 `SETTINGS max_threads/max_execution_time`                                                        | `query_time_range_distribution.csv`                  | 高       | 判断查询通常扫“近几天/近几月”                                      |
+迁移中反压：把失败率、拒绝/超时、p95/p99 延迟等作为“体验型”反压信号，配合写入量时序做分级限流；在双写或同步阶段，一旦指标恶化可按表/按用户组降低写入速率或暂停增量。
 
-## 七、资源监控（来自 VictoriaMetrics）
+| 采集内容/指标                           | 统计方式或公式（脚本口径）                                                                                                                                                                                         | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段）                                                                              | 压力风险                |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| business 表写入行数分桶（逐表）         | 从 VM 拉取计数器 `default_key_process_count{processName="normal_ck",logType!="dynamic_graph_log"}`，按 `logType` 聚合 `increase(...[bucket])`；输出为 Prom 格式时序                                          | `timeseries/business_table_writes/business_table_writes_timeseries.prom`（目录为 `timeseries/business_table_writes/`） | 低（对 CK）/中（对 VM） |
+| query_log Select 按表分桶（次数）       | 过滤 `query_kind=Select`，按表+桶聚合 `count()`                                                                                                                                                                | `timeseries/query_log_reads/`（目录内拆分为多文件）                                                                      | 中-高                   |
+| query_log 失败/拒绝/超时分桶（结果面）  | `clusterAllReplicas(system.query_log)` 统计 `type in (QueryFinish, ExceptionBeforeStart, ExceptionWhileProcessing)`，按 `query_kind+时间桶` 聚合 `failures/denials/timeouts`（同时支持 root/非 root 分组） | `timeseries/query_log_failures_timeseries.csv` / `timeseries/query_log_failures_timeseries_by_user_group.csv`          | 高                      |
+| query_log 延迟画像（p50/p95/p99/avg）   | `clusterAllReplicas(system.query_log)` 按 `query_kind+时间桶` 聚合 `quantile/avg/sum(read_bytes)/max(memory_usage)`                                                                                          | `timeseries/query_log_latency_timeseries.csv`                                                                            | 高                      |
+| query_log 延迟画像（root/非 root 聚合） | 在上述延迟画像基础上，将 `user` 聚合为 `root` 与 `non_root` 两组（保留原不聚合版本）                                                                                                                         | `timeseries/query_log_latency_timeseries_by_user_group.csv`                                                              | 高                      |
+| Top 慢查询（按 normalized_query 聚合）  | `GROUP BY normalized_query` 聚合 `count/p95/avg/sum(read_bytes)/max(memory_usage)`，按 p95 降序取 TopN                                                                                                         | `slow_queries_top.csv`                                                                                                   | 高                      |
+| Top 慢查询（root/非 root 聚合）         | 在 Top 慢查询基础上，将 `user` 聚合为 `root` 与 `non_root` 两组（保留原不聚合版本）                                                                                                                          | `slow_queries_top_by_user_group.csv`                                                                                     | 高                      |
+| 查询时间范围分布（按表，正则解析 SQL）  | 扫 `system.query_log`，对 `ql.query` 做多类正则解析估算范围天数，按表统计比例与分位；带 `SETTINGS max_threads/max_execution_time`                                                                            | `query_time_range_distribution.csv`                                                                                      | 高                      |
+| 查询时间范围分布（root/非 root 聚合）   | 在查询时间范围分布基础上，将 `user` 聚合为 `root` 与 `non_root` 两组（保留原不聚合版本）                                                                                                                     | `query_time_range_distribution_by_user_group.csv`                                                                        | 高                      |
 
-| 采集内容/指标                      | 统计方式或公式（脚本口径）                                                                | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段）     | 压力风险                | 在 CK -> SR 迁移中的作用                                          |
-| ---------------------------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------- | ----------------------- | ----------------------------------------------------------------- |
-| CK Pod 资源时序（VM query_range）  | 多条 PromQL，按窗口计算 `avg_over_time/max_over_time`（CPU/内存/网络/磁盘 IO/Throttle） | `timeseries/ck_pod_usage_timeseries.prom`       | 低（对 CK）/中（对 VM） | 识别 CK Pod 侧资源瓶颈与峰值，为 SR 侧 Pod 配额与容量规划提供对照 |
-| 集群节点资源时序（VM query_range） | 多条 PromQL，按窗口 `avg/max`（CPU/内存/磁盘/Swap/网络/IO/Load）                        | `timeseries/cluster_node_usage_timeseries.prom` | 低（对 CK）/中（对 VM） | 给出迁移窗口期的资源基线，帮助 SR 侧规划节点规格与迁移节奏        |
-| 节点磁盘使用明细（VM 瞬时 query）  | `api/v1/query` 拉 `node_filesystem_size/free` 计算 used/used%                         | `snapshots/cluster_node_disk_usage.csv`         | 低（对 CK）/中（对 VM） | 用于容量水位评估，避免磁盘不足导致迁移失败                        |
+## 六、资源监控（来自 VictoriaMetrics）
 
-# 废弃
+对最终方案制定：以 CK 现网的资源峰值与波动作为“迁移目标约束”，为 SR 侧的容量、资源配额与性能验收口径提供对照基线；同时用于定义迁移期间的监控看板与告警阈值。
 
-* 如果ingest写数据没有明显的业务低峰概念，获取分时插入表的行数可以考虑去掉
+迁移前预检：用迁移窗口期的资源基线判断是否具备上线条件（是否存在长期高负载、IO 抖动、磁盘 IO await 高、频繁 throttle 等），必要时先做扩容/均衡/调参再启动迁移。
 
-# 确认要做的
+迁移中反压：把节点与 Pod 资源时序、ClickHouseMetrics（PartsActive、MemoryTracking、连接数、活跃线程等）作为实时健康度信号，触发自动/人工限流（降低并发、缩小批次、暂停同步、延后对账校验）以保护线上。
 
-- [ ] ck实例查询数、连接数、后台任务、缓存/内存水位等可以从vm中获取
-- [X] 没获取真实节点上的磁盘剩余容量，而只是文件系统的，否则需要额外的ssh权限和账号（可以从vm获取，磁盘类型和raid无法获取，盘符），确认ck disks表 free的统计原理
-- [X] 非系统db，逻辑/物化视图获取
-- [X] 从vm的ingest获取打点，按表级别，干掉ck的按表级别查询
-- [X] 区分人查，机查的query，默认7天
-- [ ] 指标对于升级场景的作用说明
+| 采集内容/指标                            | 统计方式或公式（脚本口径）                                                                                                                                                                                                         | 导出位置（相对 `$OUTPUT_DIR` 或 JSON 字段）           | 压力风险                |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- | ----------------------- |
+| CK Pod 资源时序（VM query_range）        | 多条 PromQL，按窗口计算 `avg_over_time/max_over_time`（CPU/内存/网络/磁盘 IO/Throttle）                                                                                                                                          | `timeseries/ck_pod_usage_timeseries.prom`             | 低（对 CK）/中（对 VM） |
+| 集群节点资源时序（VM query_range）       | 多条 PromQL，按窗口 `avg/max`（CPU/内存/磁盘/Swap/网络/IO/Load/磁盘 IO 延迟 await_ms）                                                                                                                                           | `timeseries/cluster_node_usage_timeseries.prom`       | 低（对 CK）/中（对 VM） |
+| 集群节点文件系统时序（VM query_range）   | 多条 PromQL，按窗口 `avg` 输出 `node_filesystem_size/free/used_bytes/used_percent`（过滤 tmpfs/overlay 等）                                                                                                                    | `timeseries/cluster_filesystem_usage_timeseries.prom` | 低（对 CK）/中（对 VM） |
+| ClickHouseMetrics 时序（VM query_range） | 从 VM 拉取 `ClickHouseMetrics_{PartsActive,MemoryTracking,Merge,Query,GlobalThreadActive,TCPConnection,HTTPConnection,MySQLConnection,PostgreSQLConnection,InterserverConnection}`，按 `instance` 聚合后按窗口输出 `avg/max` | `timeseries/clickhouse_metrics_timeseries.prom`       | 低（对 CK）/中（对 VM） |
 
-# 待确认的
+## 七、其他
 
-- [X] 确认下arm环境,比如avx指令，starrocks所依赖的指令集
-- [ ] vm查也可能超时，it部门先确认
-- [ ] 统计分区大小可能统计不出来
+1. 考虑从events相关指标中获取查询失败和错误指标
+
+2. events/xdr的ck-exporter中获取慢查询指标，更准确
