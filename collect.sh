@@ -47,6 +47,30 @@ log() {
   >&2 echo "[$ts] $*"
 }
 
+log_collector_stats() {
+  local name="$1"
+  local path="$2"
+  local start_ts="$3"
+  local end_ts="$4"
+  local duration_s=$((end_ts - start_ts))
+  if (( duration_s < 0 )); then
+    duration_s=0
+  fi
+  local duration_min
+  duration_min=$(awk -v s="$duration_s" 'BEGIN{printf "%.2f", s/60}')
+  local size_bytes=0
+  if [[ -n "$path" && -e "$path" ]]; then
+    if [[ -d "$path" ]]; then
+      size_bytes=$(du -sk "$path" 2>/dev/null | awk '{print $1*1024}' || echo 0)
+    else
+      size_bytes=$(wc -c <"$path" 2>/dev/null || echo 0)
+    fi
+  fi
+  local size_mb
+  size_mb=$(awk -v b="$size_bytes" 'BEGIN{printf "%.2f", b/1024/1024}')
+  log "[COLLECTOR] name=${name} duration_min=${duration_min} size_mb=${size_mb} file=${path:-N/A}"
+}
+
 # 原地刷新日志（不换行），用于显示进度条
 log_progress() {
   local ts
@@ -103,6 +127,7 @@ json_lines_to_array() {
 }
 
 CLICKHOUSE_CLIENT_BASE=()
+SCRIPT_START_TS=$(date +%s)
 CK_USER="${CK_USER:-}"
 CK_PASSWORD="${CK_PASSWORD:-}"
 CK_DATABASE_BUSINESS="${CK_DATABASE_BUSINESS:-business}"
@@ -341,7 +366,7 @@ QUERY_TIME_RANGE_DAYS=$((QUERY_TIME_RANGE_DAYS))
 QUERY_TIME_RANGE_MAX_THREADS=$((QUERY_TIME_RANGE_MAX_THREADS))
 QUERY_TIME_RANGE_MAX_SECONDS=$((QUERY_TIME_RANGE_MAX_SECONDS))
 VM_BUCKET_INTERVAL_MINUTES=$((VM_BUCKET_INTERVAL_MINUTES))
-(( BUCKET_INTERVAL_MINUTES <= 0 )) && BUCKET_INTERVAL_MINUTES=30
+(( BUCKET_INTERVAL_MINUTES <= 0 )) && BUCKET_INTERVAL_MINUTES=60
 (( RESOURCE_HISTORY_DAYS <= 0 )) && RESOURCE_HISTORY_DAYS=30
 (( QUERY_TIME_RANGE_DAYS <= 0 )) && QUERY_TIME_RANGE_DAYS=30
 (( QUERY_TIME_RANGE_MAX_THREADS <= 0 )) && QUERY_TIME_RANGE_MAX_THREADS=2
@@ -662,7 +687,7 @@ BUSINESS_TIME_TARGETS_FILE="$TMP_DIR/business_time_targets.tsv"
 log "Parsing business time config from $BUSINESS_TIME_CONFIG"
 parse_business_time_config "$BUSINESS_TIME_CONFIG" "$BUSINESS_TIME_TARGETS_FILE"
 
-# 准备 Helm 配置输出目录
+HELM_VALUES_START_TS=$(date +%s)
 HELM_OUTPUT_DIR="$OUTPUT_DIR/helm"
 mkdir -p "$HELM_OUTPUT_DIR"
 log "Collecting Helm release values from namespace: $CK_HELM_NAMESPACE"
@@ -687,6 +712,9 @@ if RELEASES=$(helm list -n "$CK_HELM_NAMESPACE" -q 2>/dev/null); then
 else
   log "ERROR: 'helm list' failed. Check kubectl context and permissions."
 fi
+
+HELM_VALUES_END_TS=$(date +%s)
+log_collector_stats "helm_values" "$HELM_OUTPUT_DIR" "$HELM_VALUES_START_TS" "$HELM_VALUES_END_TS"
 
 # 集群基础信息统计
 log "Querying ClickHouse version"
@@ -718,7 +746,7 @@ if [[ -n "$CHI_SHARDS" && -n "$CHI_REPLICAS" ]]; then
   CHI_EXPECTED_NODE_COUNT=$((CHI_SHARDS * CHI_REPLICAS))
 fi
 
-# 表基础数据采集（全量 + 去重后的物理体积）
+TABLE_STATS_START_TS=$(date +%s)
 log "Collecting table statistics (CSV)"
 TABLE_STATS_CSV="$OUTPUT_DIR/table_stats.csv"
 # 说明：这里先通过 system.tables 拿到所有表定义（包括空表、Distributed 表等），
@@ -761,7 +789,10 @@ SQL
 )
 run_clickhouse_to_csv "$TABLE_STATS_SQL" "$TABLE_STATS_CSV"
 
-# ClickHouse 存储卷（system.disks）
+TABLE_STATS_END_TS=$(date +%s)
+log_collector_stats "table_stats" "$TABLE_STATS_CSV" "$TABLE_STATS_START_TS" "$TABLE_STATS_END_TS"
+
+STORAGE_VOLUMES_START_TS=$(date +%s)
 log "Collecting cluster-wide storage volume info (system.disks)"
 STORAGE_VOLUMES_CSV="$SNAPSHOTS_DIR/cluster_storage_volumes.csv"
 STORAGE_SQL=$(cat <<SQL
@@ -778,6 +809,10 @@ SQL
 )
 run_clickhouse_to_csv "$STORAGE_SQL" "$STORAGE_VOLUMES_CSV"
 
+STORAGE_VOLUMES_END_TS=$(date +%s)
+log_collector_stats "cluster_storage_volumes" "$STORAGE_VOLUMES_CSV" "$STORAGE_VOLUMES_START_TS" "$STORAGE_VOLUMES_END_TS"
+
+K8S_NODES_START_TS=$(date +%s)
 log "Collecting K8s cluster node inventory"
 K8S_NODES_CSV="$SNAPSHOTS_DIR/cluster_k8s_nodes.csv"
 echo "name,internal_ip,os_image,kernel_version,cpu_capacity,memory_capacity,cpu_allocatable,memory_allocatable,creation_timestamp" > "$K8S_NODES_CSV"
@@ -785,8 +820,11 @@ if ! kubectl get nodes -o jsonpath='{range .items[*]}"{.metadata.name}","{.statu
   log "WARNING: Failed to collect node inventory via kubectl"
 fi
 
+K8S_NODES_END_TS=$(date +%s)
+log_collector_stats "cluster_k8s_nodes" "$K8S_NODES_CSV" "$K8S_NODES_START_TS" "$K8S_NODES_END_TS"
 
 # business 表 TTL 信息输出为 CSV，同时提取 TTL 数值
+BUSINESS_TTL_START_TS=$(date +%s)
 log "Collecting business TTL metadata (CSV)"
 BUSINESS_TTL_CSV="$OUTPUT_DIR/business_ttl.csv"
 run_clickhouse_to_csv $'SELECT
@@ -807,11 +845,19 @@ FROM (
 )
 ORDER BY database, table' "$BUSINESS_TTL_CSV"
 
+BUSINESS_TTL_END_TS=$(date +%s)
+log_collector_stats "business_ttl" "$BUSINESS_TTL_CSV" "$BUSINESS_TTL_START_TS" "$BUSINESS_TTL_END_TS"
+
 # 所有表 schema 信息输出到 CSV，方便表格查看
+TABLE_SCHEMA_START_TS=$(date +%s)
 log "Collecting table schema (CSV)"
 TABLE_SCHEMA_CSV="$OUTPUT_DIR/table_schema.csv"
 run_clickhouse_to_csv $'SELECT database, table, name AS column, type, default_kind, default_expression FROM system.columns WHERE database NOT IN (\'system\', \'information_schema\', \'INFORMATION_SCHEMA\') ORDER BY database, table, column' "$TABLE_SCHEMA_CSV"
 
+TABLE_SCHEMA_END_TS=$(date +%s)
+log_collector_stats "table_schema" "$TABLE_SCHEMA_CSV" "$TABLE_SCHEMA_START_TS" "$TABLE_SCHEMA_END_TS"
+
+VIEWS_DDL_START_TS=$(date +%s)
 log "Collecting view and materialized view definitions (CSV)"
 VIEWS_DDL_CSV="$OUTPUT_DIR/views_ddl.csv"
 printf 'database,view,engine,create_table_query_one_line\n' >"$VIEWS_DDL_CSV"
@@ -836,17 +882,26 @@ else
   log "WARNING: system.tables.create_table_query not found; skipping view definitions"
 fi
 
+VIEWS_DDL_END_TS=$(date +%s)
+log_collector_stats "views_ddl" "$VIEWS_DDL_CSV" "$VIEWS_DDL_START_TS" "$VIEWS_DDL_END_TS"
+
+SYSTEM_SETTINGS_START_TS=$(date +%s)
 log "Collecting system.settings (CSV)"
 SYSTEM_SETTINGS_CSV="$SNAPSHOTS_DIR/system_settings.csv"
 if ! run_clickhouse_to_csv "SELECT name, value, changed, description FROM system.settings ORDER BY name" "$SYSTEM_SETTINGS_CSV"; then
   log "WARNING: Failed to collect system.settings"
 fi
+SYSTEM_SETTINGS_END_TS=$(date +%s)
+log_collector_stats "system_settings" "$SYSTEM_SETTINGS_CSV" "$SYSTEM_SETTINGS_START_TS" "$SYSTEM_SETTINGS_END_TS"
 
+SYSTEM_BUILD_OPTIONS_START_TS=$(date +%s)
 log "Collecting system.build_options (CSV)"
 SYSTEM_BUILD_OPTIONS_CSV="$SNAPSHOTS_DIR/system_build_options.csv"
 if ! run_clickhouse_to_csv "SELECT name, value FROM system.build_options ORDER BY name" "$SYSTEM_BUILD_OPTIONS_CSV"; then
   log "WARNING: Failed to collect system.build_options"
 fi
+SYSTEM_BUILD_OPTIONS_END_TS=$(date +%s)
+log_collector_stats "system_build_options" "$SYSTEM_BUILD_OPTIONS_CSV" "$SYSTEM_BUILD_OPTIONS_START_TS" "$SYSTEM_BUILD_OPTIONS_END_TS"
 
 # query_log 流量画像（写入 + 读取）
 # log "Collecting query_log metrics for Inserts"
@@ -876,6 +931,7 @@ fi
 # split_csv_by_table "$BUSINESS_QUERY_LOG_WRITES_TMP" "$BUSINESS_QUERY_LOG_WRITES_DIR"
 #
 # query_log 流量画像（读取）
+BUSINESS_QUERY_LOG_READS_START_TS=$(date +%s)
 log "Collecting query_log metrics for Selects"
 # 读取类 query_log 分表拆分
 BUSINESS_QUERY_LOG_READS_TMP="$TMP_DIR/business_query_log_reads.csv"
@@ -902,6 +958,9 @@ SQL
 run_clickhouse_to_csv "$BUSINESS_QUERY_LOG_READS_SQL" "$BUSINESS_QUERY_LOG_READS_TMP"
 split_csv_by_table "$BUSINESS_QUERY_LOG_READS_TMP" "$BUSINESS_QUERY_LOG_READS_DIR"
 
+BUSINESS_QUERY_LOG_READS_END_TS=$(date +%s)
+log_collector_stats "query_log_reads_by_table" "$BUSINESS_QUERY_LOG_READS_DIR" "$BUSINESS_QUERY_LOG_READS_START_TS" "$BUSINESS_QUERY_LOG_READS_END_TS"
+
 QUERY_LOG_USER_COLUMN=""
 if ck_has_column "system" "query_log" "user"; then
   QUERY_LOG_USER_COLUMN="user"
@@ -912,9 +971,10 @@ fi
 BUSINESS_QUERY_LOG_READS_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_log_reads_by_user_group.csv"
 if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
   log "Collecting query_log metrics for Selects by user group (CSV)"
+  BUSINESS_QUERY_LOG_READS_BY_USER_GROUP_START_TS=$(date +%s)
   run_clickhouse_to_csv "$(cat <<SQL
 SELECT
-  if($QUERY_LOG_USER_COLUMN = 'root', 'root', '__NON_ROOT__') AS user_group,
+  if($QUERY_LOG_USER_COLUMN = 'user_xdr_log_search_readonly', 'user_xdr_log_search_readonly', '__NON_HUMAN__') AS user_group,
   arrayElement(databases, idx) AS database,
   arrayElement(tables, idx) AS table,
   toStartOfInterval(event_time, INTERVAL {bucket_interval_minutes:Int32} MINUTE) AS start_time,
@@ -933,6 +993,8 @@ GROUP BY user_group, database, table, start_time, end_time
 ORDER BY user_group, database, table, start_time
 SQL
 )" "$BUSINESS_QUERY_LOG_READS_BY_USER_GROUP_CSV" || log "WARNING: Failed to collect query_log selects by user group"
+  BUSINESS_QUERY_LOG_READS_BY_USER_GROUP_END_TS=$(date +%s)
+  log_collector_stats "query_log_reads_by_user_group" "$BUSINESS_QUERY_LOG_READS_BY_USER_GROUP_CSV" "$BUSINESS_QUERY_LOG_READS_BY_USER_GROUP_START_TS" "$BUSINESS_QUERY_LOG_READS_BY_USER_GROUP_END_TS"
 else
   BUSINESS_QUERY_LOG_READS_BY_USER_GROUP_CSV=""
 fi
@@ -1024,6 +1086,7 @@ fi
 log "Collecting query_log latency and bytes metrics (CSV)"
 QUERY_LOG_LATENCY_CSV="$TIMESERIES_DIR/query_log_latency_timeseries.csv"
 echo "query_kind,start_time,end_time,queries,p50_ms,p95_ms,p99_ms,avg_ms,sum_read_bytes,max_memory_usage_bytes" >"$QUERY_LOG_LATENCY_CSV"
+QUERY_LOG_LATENCY_START_TS=$(date +%s)
 if ck_has_column "system" "query_log" "query_duration_ms"; then
   READ_BYTES_EXPR="0"
   if ck_has_column "system" "query_log" "read_bytes"; then
@@ -1054,6 +1117,9 @@ WHERE
   AND has(databases, {CK_DATABASE_BUSINESS:String})
 GROUP BY query_kind, start_time, end_time
 ORDER BY query_kind, start_time
+SETTINGS
+  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
 SQL
 )
   if ! run_clickhouse_to_csv "$QUERY_LOG_LATENCY_SQL" "$QUERY_LOG_LATENCY_CSV"; then
@@ -1065,7 +1131,7 @@ SQL
     echo "user_group,query_kind,start_time,end_time,queries,p50_ms,p95_ms,p99_ms,avg_ms,sum_read_bytes,max_memory_usage_bytes" >"$QUERY_LOG_LATENCY_BY_USER_GROUP_CSV"
     if ! run_clickhouse_to_csv "$(cat <<SQL
 SELECT
-  if($QUERY_LOG_USER_COLUMN = 'root', 'root', '__NON_ROOT__') AS user_group,
+  if($QUERY_LOG_USER_COLUMN = 'user_xdr_log_search_readonly', 'user_xdr_log_search_readonly', '__NON_HUMAN__') AS user_group,
   query_kind,
   toStartOfInterval(event_time, INTERVAL {bucket_interval_minutes:Int32} MINUTE) AS start_time,
   toStartOfInterval(event_time, INTERVAL {bucket_interval_minutes:Int32} MINUTE) + INTERVAL {bucket_interval_minutes:Int32} MINUTE AS end_time,
@@ -1085,6 +1151,9 @@ WHERE
   AND has(databases, {CK_DATABASE_BUSINESS:String})
 GROUP BY user_group, query_kind, start_time, end_time
 ORDER BY user_group, query_kind, start_time
+      SETTINGS
+        max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+        max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
 SQL
 )" "$QUERY_LOG_LATENCY_BY_USER_GROUP_CSV"; then
       log "WARNING: Failed to collect query_log latency metrics by user group. Skipping."
@@ -1092,6 +1161,8 @@ SQL
   else
     QUERY_LOG_LATENCY_BY_USER_GROUP_CSV=""
   fi
+  QUERY_LOG_LATENCY_END_TS=$(date +%s)
+  log_collector_stats "query_log_latency_timeseries" "$QUERY_LOG_LATENCY_CSV" "$QUERY_LOG_LATENCY_START_TS" "$QUERY_LOG_LATENCY_END_TS"
 else
   log "WARNING: system.query_log.query_duration_ms not found. Skipping query_log latency metrics."
   QUERY_LOG_LATENCY_BY_USER_GROUP_CSV=""
@@ -1101,6 +1172,7 @@ log "Collecting query_log failures/denials/timeouts metrics (CSV)"
 QUERY_LOG_FAILURES_CSV="$TIMESERIES_DIR/query_log_failures_timeseries.csv"
 QUERY_LOG_FAILURES_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_log_failures_timeseries_by_user_group.csv"
 echo "query_kind,start_time,end_time,queries,failures,denials,timeouts" >"$QUERY_LOG_FAILURES_CSV"
+QUERY_LOG_FAILURES_START_TS=$(date +%s)
 if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
   echo "user_group,query_kind,start_time,end_time,queries,failures,denials,timeouts" >"$QUERY_LOG_FAILURES_BY_USER_GROUP_CSV"
 else
@@ -1148,6 +1220,9 @@ WHERE
   AND has(databases, {CK_DATABASE_BUSINESS:String})
 GROUP BY query_kind, start_time, end_time
 ORDER BY query_kind, start_time
+SETTINGS
+  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
 SQL
 )
 if ! run_clickhouse_to_csv "$QUERY_LOG_FAILURES_SQL" "$QUERY_LOG_FAILURES_CSV"; then
@@ -1164,7 +1239,7 @@ WITH
     OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'timed out') > 0
     OR $EXCEPTION_POS_FN($EXCEPTION_MATCH_TEXT_EXPR, 'timeout exceeded') > 0) AS is_timeout
 SELECT
-  if($QUERY_LOG_USER_COLUMN = 'root', 'root', '__NON_ROOT__') AS user_group,
+  if($QUERY_LOG_USER_COLUMN = 'user_xdr_log_search_readonly', 'user_xdr_log_search_readonly', '__NON_HUMAN__') AS user_group,
   query_kind,
   toStartOfInterval(event_time, INTERVAL {bucket_interval_minutes:Int32} MINUTE) AS start_time,
   toStartOfInterval(event_time, INTERVAL {bucket_interval_minutes:Int32} MINUTE) + INTERVAL {bucket_interval_minutes:Int32} MINUTE AS end_time,
@@ -1181,14 +1256,20 @@ WHERE
   AND has(databases, {CK_DATABASE_BUSINESS:String})
 GROUP BY user_group, query_kind, start_time, end_time
 ORDER BY user_group, query_kind, start_time
+SETTINGS
+  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
 SQL
 )" "$QUERY_LOG_FAILURES_BY_USER_GROUP_CSV"; then
     log "WARNING: Failed to collect query_log failure metrics by user group"
   fi
 fi
+QUERY_LOG_FAILURES_END_TS=$(date +%s)
+log_collector_stats "query_log_failures_timeseries" "$QUERY_LOG_FAILURES_CSV" "$QUERY_LOG_FAILURES_START_TS" "$QUERY_LOG_FAILURES_END_TS"
 
-log "Collecting top slow queries in last 30 days (CSV)"
-SLOW_QUERIES_CSV="$OUTPUT_DIR/slow_queries_top.csv"
+SLOW_QUERIES_START_TS=$(date +%s)
+log "Collecting top slow queries in last ${RESOURCE_HISTORY_DAYS} days (CSV)"
+SLOW_QUERIES_CSV="$TIMESERIES_DIR/slow_queries_top.csv"
 echo "query_kind,normalized_query,queries,p95_query_duration_ms,avg_query_duration_ms,sum_read_bytes,max_memory_usage_bytes" >"$SLOW_QUERIES_CSV"
 if ck_has_column "system" "query_log" "query_duration_ms"; then
   SLOW_QUERY_TOP_N=100
@@ -1217,7 +1298,7 @@ SELECT
   max($MEMORY_USAGE_EXPR) AS max_memory_usage_bytes
 FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log)
 WHERE
-  event_time >= now() - INTERVAL 30 DAY
+  event_time >= now() - INTERVAL {resource_history_days:Int32} DAY
   AND type = 'QueryFinish'
   AND is_initial_query = 1
   AND query_kind = 'Select'
@@ -1225,18 +1306,24 @@ WHERE
 GROUP BY query_kind, normalized_query
 ORDER BY p95_query_duration_ms DESC
 LIMIT $SLOW_QUERY_TOP_N
+SETTINGS
+  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
 SQL
 )
   if ! run_clickhouse_to_csv "$SLOW_QUERIES_SQL" "$SLOW_QUERIES_CSV"; then
     log "WARNING: Failed to collect slow queries"
   fi
 
-  SLOW_QUERIES_BY_USER_GROUP_CSV="$OUTPUT_DIR/slow_queries_top_by_user_group.csv"
+  SLOW_QUERIES_END_TS=$(date +%s)
+  log_collector_stats "slow_queries_top" "$SLOW_QUERIES_CSV" "$SLOW_QUERIES_START_TS" "$SLOW_QUERIES_END_TS"
+
+  SLOW_QUERIES_BY_USER_GROUP_CSV="$TIMESERIES_DIR/slow_queries_top_by_user_group.csv"
   if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
     echo "user_group,query_kind,normalized_query,queries,p95_query_duration_ms,avg_query_duration_ms,sum_read_bytes,max_memory_usage_bytes" >"$SLOW_QUERIES_BY_USER_GROUP_CSV"
     if ! run_clickhouse_to_csv "$(cat <<SQL
 SELECT
-  if($QUERY_LOG_USER_COLUMN = 'root', 'root', '__NON_ROOT__') AS user_group,
+  if($QUERY_LOG_USER_COLUMN = 'user_xdr_log_search_readonly', 'user_xdr_log_search_readonly', '__NON_HUMAN__') AS user_group,
   query_kind,
   $NORMALIZED_QUERY_EXPR AS normalized_query,
   count() AS queries,
@@ -1246,7 +1333,7 @@ SELECT
   max($MEMORY_USAGE_EXPR) AS max_memory_usage_bytes
 FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log)
 WHERE
-  event_time >= now() - INTERVAL 30 DAY
+  event_time >= now() - INTERVAL {resource_history_days:Int32} DAY
   AND type = 'QueryFinish'
   AND is_initial_query = 1
   AND query_kind = 'Select'
@@ -1254,10 +1341,15 @@ WHERE
 GROUP BY user_group, query_kind, normalized_query
 ORDER BY user_group, p95_query_duration_ms DESC
 LIMIT $SLOW_QUERY_TOP_N BY user_group
+SETTINGS
+  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
 SQL
 )" "$SLOW_QUERIES_BY_USER_GROUP_CSV"; then
       log "WARNING: Failed to collect slow queries by user group"
     fi
+    SLOW_QUERIES_BY_USER_GROUP_END_TS=$(date +%s)
+    log_collector_stats "slow_queries_top_by_user_group" "$SLOW_QUERIES_BY_USER_GROUP_CSV" "$SLOW_QUERIES_START_TS" "$SLOW_QUERIES_BY_USER_GROUP_END_TS"
   else
     SLOW_QUERIES_BY_USER_GROUP_CSV=""
   fi
@@ -1267,9 +1359,15 @@ else
 fi
 
 log "Collecting query time range distribution (last ${QUERY_TIME_RANGE_DAYS} days)"
-QUERY_TIME_RANGE_CSV="$OUTPUT_DIR/query_time_range_distribution.csv"
-QUERY_TIME_RANGE_BY_USER_GROUP_CSV=""
+QUERY_TIME_RANGE_CSV="$TIMESERIES_DIR/query_time_range_distribution.csv"
+QUERY_TIME_RANGE_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_time_range_distribution_by_user_group.csv"
+QUERY_TIME_RANGE_STRICT_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict.csv"
+QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict_by_user_group.csv"
 echo "table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_CSV"
+: >"$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"
+: >"$QUERY_TIME_RANGE_STRICT_CSV"
+: >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
+QUERY_TIME_RANGE_START_TS=$(date +%s)
 if ck_has_column "system" "query_log" "tables"; then
   QUERY_LOG_FILTER=""
   if ck_has_column "system" "query_log" "event_date"; then
@@ -1452,6 +1550,8 @@ SQL
     if ! run_clickhouse_to_csv "$QUERY_TIME_RANGE_SQL" "$QUERY_TIME_RANGE_CSV"; then
       log "WARNING: Failed to collect query time range distribution"
     fi
+    QUERY_TIME_RANGE_END_TS=$(date +%s)
+    log_collector_stats "query_time_range_distribution" "$QUERY_TIME_RANGE_CSV" "$QUERY_TIME_RANGE_START_TS" "$QUERY_TIME_RANGE_END_TS"
 
     QUERY_TIME_RANGE_BY_USER_GROUP_CSV="$OUTPUT_DIR/query_time_range_distribution_by_user_group.csv"
     if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
@@ -1463,7 +1563,7 @@ WITH
       FROM
       (
         SELECT
-          if(ql.$QUERY_LOG_USER_COLUMN = 'root', 'root', '__NON_ROOT__') AS user_group,
+          if(ql.$QUERY_LOG_USER_COLUMN = 'user_xdr_log_search_readonly', 'user_xdr_log_search_readonly', '__NON_HUMAN__') AS user_group,
           ql.event_time,
           $TABLE_DB_EXPR,
           $TABLE_TBL_EXPR,
@@ -1612,16 +1712,294 @@ SQL
       if ! run_clickhouse_to_csv "$QUERY_TIME_RANGE_BY_USER_GROUP_SQL" "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"; then
         log "WARNING: Failed to collect query time range distribution by user group"
       fi
-    else
+  else
       QUERY_TIME_RANGE_BY_USER_GROUP_CSV=""
     fi
+    QUERY_TIME_RANGE_BY_USER_GROUP_END_TS=$(date +%s)
+    log_collector_stats "query_time_range_distribution_by_user_group" "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV" "$QUERY_TIME_RANGE_START_TS" "$QUERY_TIME_RANGE_BY_USER_GROUP_END_TS"
   fi
-else
-  log "WARNING: system.query_log.tables not found. Skipping query time range distribution."
-  QUERY_TIME_RANGE_BY_USER_GROUP_CSV=""
-fi
 
-# CK parts/partition 压力快照（用于判断合并压力与迁移风险）
+    QUERY_TIME_RANGE_STRICT_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict.csv"
+    echo "table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_CSV"
+    QUERY_TIME_RANGE_STRICT_START_TS=$(date +%s)
+    QUERY_TIME_RANGE_STRICT_SQL=$(cat <<SQL
+WITH
+    per_query AS (
+      SELECT *
+      FROM
+      (
+        SELECT
+          ql.event_time,
+          $TABLE_DB_EXPR,
+          $TABLE_TBL_EXPR,
+          multiIf($IN_CONFIG_CASES 0) AS in_config,
+
+          multiIf($TS_START_CASES []) AS ts_start_matches,
+          multiIf($TS_END_CASES []) AS ts_end_matches,
+          multiIf($TS_START_DATE_CASES []) AS date_start_matches,
+          multiIf($TS_END_DATE_CASES []) AS date_end_matches
+        FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log) AS ql
+        ARRAY JOIN ql.tables AS t
+        WHERE
+          ql.event_time >= now() - INTERVAL {query_time_range_days:Int32} DAY
+          $QUERY_LOG_FILTER
+          AND ql.type = 'QueryFinish'
+          AND ql.is_initial_query = 1
+          AND ql.query_kind = 'Select'
+          AND has(ql.databases, {CK_DATABASE_BUSINESS:String})
+          AND (
+            startsWith(t, concat({CK_DATABASE_BUSINESS:String}, '.'))
+            OR
+            (position(t, '.') = 0 AND has(ql.databases, {CK_DATABASE_BUSINESS:String}))
+          )
+      )
+      WHERE in_config = 1
+    ),
+    per_query_ranges AS (
+      SELECT
+        table_name,
+        multiIf(
+          ts_start_dt > toDateTime(0) AND ts_end_dt > toDateTime(0) AND ts_end_dt >= ts_start_dt,
+            greatest(1.0, dateDiff('second', ts_start_dt, ts_end_dt) / 86400.0),
+          ts_start_dt > toDateTime(0),
+            greatest(1.0, dateDiff('second', ts_start_dt, event_time) / 86400.0),
+          date_start_dt > toDateTime(0) AND date_end_dt > toDateTime(0) AND date_end_dt >= date_start_dt,
+            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(date_end_dt)) + 1)),
+          date_start_dt > toDateTime(0),
+            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(event_time)) + 1)),
+          0.0
+        ) AS estimated_days_range
+      FROM
+      (
+        SELECT
+          event_time,
+          table_tbl AS table_name,
+          ts_start_matches,
+          ts_end_matches,
+          date_start_matches,
+          date_end_matches,
+          if(length(ts_start_matches) > 0, arrayMax(arrayMap(x -> toInt64OrZero(x), ts_start_matches)), toInt64(0)) AS ts_start_raw,
+          if(
+            length(ts_end_matches) > 0,
+            if(
+              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches)) = toInt64(9223372036854775807),
+              toInt64(0),
+              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches))
+            ),
+            toInt64(0)
+          ) AS ts_end_raw,
+          if(ts_start_raw > 0, toDateTime(ts_start_raw), toDateTime(0)) AS ts_start_dt,
+          if(ts_end_raw > 0, toDateTime(ts_end_raw), toDateTime(0)) AS ts_end_dt,
+          if(length(date_start_matches) > 0, arrayMax(arrayMap(x -> toInt32(toRelativeDayNum(toDateOrZero(x))), date_start_matches)), toInt32(0)) AS date_start_daynum,
+          if(
+            length(date_end_matches) > 0,
+            if(
+              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches)) = toInt32(2147483647),
+              toInt32(0),
+              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches))
+            ),
+            toInt32(0)
+          ) AS date_end_daynum,
+          if(date_start_daynum > 0, toDateTime(addDays(toDate(0), date_start_daynum)), toDateTime(0)) AS date_start_dt,
+          if(date_end_daynum > 0, toDateTime(addDays(toDate(0), date_end_daynum)), toDateTime(0)) AS date_end_dt
+        FROM per_query
+      )
+    )
+
+SELECT *
+FROM
+(
+  SELECT
+    table_name,
+    count() AS query_count,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
+    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
+    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
+    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
+    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+  FROM per_query_ranges
+  GROUP BY table_name
+
+  UNION ALL
+
+  SELECT
+    '__ALL__' AS table_name,
+    count() AS query_count,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
+    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
+    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
+    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
+    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+  FROM per_query_ranges
+)
+ORDER BY query_count DESC
+SETTINGS
+  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
+SQL
+)
+    if ! run_clickhouse_to_csv "$QUERY_TIME_RANGE_STRICT_SQL" "$QUERY_TIME_RANGE_STRICT_CSV"; then
+      log "WARNING: Failed to collect strict query time range distribution"
+    fi
+    QUERY_TIME_RANGE_STRICT_END_TS=$(date +%s)
+    log_collector_stats "query_time_range_distribution_strict" "$QUERY_TIME_RANGE_STRICT_CSV" "$QUERY_TIME_RANGE_STRICT_START_TS" "$QUERY_TIME_RANGE_STRICT_END_TS"
+
+    if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
+      QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV="$OUTPUT_DIR/query_time_range_distribution_strict_by_user_group.csv"
+      echo "user_group,table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
+      QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_SQL=$(cat <<SQL
+WITH
+    per_query AS (
+      SELECT *
+      FROM
+      (
+        SELECT
+          if(ql.$QUERY_LOG_USER_COLUMN = 'user_xdr_log_search_readonly', 'user_xdr_log_search_readonly', '__NON_HUMAN__') AS user_group,
+          ql.event_time,
+          $TABLE_DB_EXPR,
+          $TABLE_TBL_EXPR,
+          multiIf($IN_CONFIG_CASES 0) AS in_config,
+
+          multiIf($TS_START_CASES []) AS ts_start_matches,
+          multiIf($TS_END_CASES []) AS ts_end_matches,
+          multiIf($TS_START_DATE_CASES []) AS date_start_matches,
+          multiIf($TS_END_DATE_CASES []) AS date_end_matches
+        FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log) AS ql
+        ARRAY JOIN ql.tables AS t
+        WHERE
+          ql.event_time >= now() - INTERVAL {query_time_range_days:Int32} DAY
+          $QUERY_LOG_FILTER
+          AND ql.type = 'QueryFinish'
+          AND ql.is_initial_query = 1
+          AND ql.query_kind = 'Select'
+          AND has(ql.databases, {CK_DATABASE_BUSINESS:String})
+          AND (
+            startsWith(t, concat({CK_DATABASE_BUSINESS:String}, '.'))
+            OR
+            (position(t, '.') = 0 AND has(ql.databases, {CK_DATABASE_BUSINESS:String}))
+          )
+      )
+      WHERE in_config = 1
+    ),
+    per_query_ranges AS (
+      SELECT
+        user_group,
+        table_name,
+        multiIf(
+          ts_start_dt > toDateTime(0) AND ts_end_dt > toDateTime(0) AND ts_end_dt >= ts_start_dt,
+            greatest(1.0, dateDiff('second', ts_start_dt, ts_end_dt) / 86400.0),
+          ts_start_dt > toDateTime(0),
+            greatest(1.0, dateDiff('second', ts_start_dt, event_time) / 86400.0),
+          date_start_dt > toDateTime(0) AND date_end_dt > toDateTime(0) AND date_end_dt >= date_start_dt,
+            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(date_end_dt)) + 1)),
+          date_start_dt > toDateTime(0),
+            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(event_time)) + 1)),
+          0.0
+        ) AS estimated_days_range
+      FROM
+      (
+        SELECT
+          user_group,
+          event_time,
+          table_tbl AS table_name,
+          ts_start_matches,
+          ts_end_matches,
+          date_start_matches,
+          date_end_matches,
+          if(length(ts_start_matches) > 0, arrayMax(arrayMap(x -> toInt64OrZero(x), ts_start_matches)), toInt64(0)) AS ts_start_raw,
+          if(
+            length(ts_end_matches) > 0,
+            if(
+              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches)) = toInt64(9223372036854775807),
+              toInt64(0),
+              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches))
+            ),
+            toInt64(0)
+          ) AS ts_end_raw,
+          if(ts_start_raw > 0, toDateTime(ts_start_raw), toDateTime(0)) AS ts_start_dt,
+          if(ts_end_raw > 0, toDateTime(ts_end_raw), toDateTime(0)) AS ts_end_dt,
+          if(length(date_start_matches) > 0, arrayMax(arrayMap(x -> toInt32(toRelativeDayNum(toDateOrZero(x))), date_start_matches)), toInt32(0)) AS date_start_daynum,
+          if(
+            length(date_end_matches) > 0,
+            if(
+              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches)) = toInt32(2147483647),
+              toInt32(0),
+              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches))
+            ),
+            toInt32(0)
+          ) AS date_end_daynum,
+          if(date_start_daynum > 0, toDateTime(addDays(toDate(0), date_start_daynum)), toDateTime(0)) AS date_start_dt,
+          if(date_end_daynum > 0, toDateTime(addDays(toDate(0), date_end_daynum)), toDateTime(0)) AS date_end_dt
+        FROM per_query
+      )
+    )
+
+SELECT *
+FROM
+(
+  SELECT
+    user_group,
+    table_name,
+    count() AS query_count,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
+    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
+    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
+    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
+    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+  FROM per_query_ranges
+  GROUP BY user_group, table_name
+
+  UNION ALL
+
+  SELECT
+    user_group,
+    '__ALL__' AS table_name,
+    count() AS query_count,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
+    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
+    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
+    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
+    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
+    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+  FROM per_query_ranges
+  GROUP BY user_group
+)
+ORDER BY query_count DESC
+SETTINGS
+  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
+SQL
+)
+      if ! run_clickhouse_to_csv "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_SQL" "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"; then
+        log "WARNING: Failed to collect strict query time range distribution by user group"
+      fi
+      QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_END_TS=$(date +%s)
+      log_collector_stats "query_time_range_distribution_strict_by_user_group" "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV" "$QUERY_TIME_RANGE_STRICT_START_TS" "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_END_TS"
+    else
+      QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV=""
+    fi
+  fi
+
+PARTS_SNAPSHOT_START_TS=$(date +%s)
 log "Collecting parts and partitions snapshot (CSV)"
 PARTS_SNAPSHOT_CSV="$SNAPSHOTS_DIR/cluster_parts_snapshot.csv"
 PARTS_SNAPSHOT_SQL=$(cat <<SQL
@@ -1649,8 +2027,10 @@ SQL
 if ! run_clickhouse_to_csv "$PARTS_SNAPSHOT_SQL" "$PARTS_SNAPSHOT_CSV"; then
   log "WARNING: Failed to collect parts snapshot."
 fi
+PARTS_SNAPSHOT_END_TS=$(date +%s)
+log_collector_stats "cluster_parts_snapshot" "$PARTS_SNAPSHOT_CSV" "$PARTS_SNAPSHOT_START_TS" "$PARTS_SNAPSHOT_END_TS"
 
-# CK merges/mutations 快照（用于识别后台任务是否已经很紧）
+MERGES_SNAPSHOT_START_TS=$(date +%s)
 log "Collecting merges snapshot (CSV)"
 MERGES_SNAPSHOT_CSV="$SNAPSHOTS_DIR/cluster_merges_snapshot.csv"
 MERGES_SNAPSHOT_SQL=$(cat <<SQL
@@ -1668,6 +2048,10 @@ if ! run_clickhouse_to_csv "$MERGES_SNAPSHOT_SQL" "$MERGES_SNAPSHOT_CSV"; then
   log "WARNING: Failed to collect merges snapshot."
 fi
 
+MERGES_SNAPSHOT_END_TS=$(date +%s)
+log_collector_stats "cluster_merges_snapshot" "$MERGES_SNAPSHOT_CSV" "$MERGES_SNAPSHOT_START_TS" "$MERGES_SNAPSHOT_END_TS"
+
+MUTATIONS_SNAPSHOT_START_TS=$(date +%s)
 log "Collecting mutations snapshot (CSV)"
 MUTATIONS_SNAPSHOT_CSV="$SNAPSHOTS_DIR/cluster_mutations_snapshot.csv"
 MUTATIONS_SNAPSHOT_SQL=$(cat <<SQL
@@ -1685,6 +2069,9 @@ SQL
 if ! run_clickhouse_to_csv "$MUTATIONS_SNAPSHOT_SQL" "$MUTATIONS_SNAPSHOT_CSV"; then
   log "WARNING: Failed to collect mutations snapshot."
 fi
+
+MUTATIONS_SNAPSHOT_END_TS=$(date +%s)
+log_collector_stats "cluster_mutations_snapshot" "$MUTATIONS_SNAPSHOT_CSV" "$MUTATIONS_SNAPSHOT_START_TS" "$MUTATIONS_SNAPSHOT_END_TS"
 
 log "Discovering all cluster nodes via kubectl"
 # 获取所有节点的 InternalIP。
@@ -1722,11 +2109,19 @@ vm_query_instant_to_file() {
     printf '{"status":"error","data":{"result":[]}}' >"$outfile"
     return 0
   fi
-  if [[ -n "$eval_ts" ]]; then
-    curl -sS --fail --get --data-urlencode "query=$promql" --data-urlencode "time=$eval_ts" "$base/api/v1/query" >"$outfile"
-  else
-    curl -sS --fail --get --data-urlencode "query=$promql" "$base/api/v1/query" >"$outfile"
-  fi
+  local attempt
+  for attempt in 1 2 3; do
+    if [[ -n "$eval_ts" ]]; then
+      if curl -sS --fail --max-time 60 --get --data-urlencode "query=$promql" --data-urlencode "time=$eval_ts" "$base/api/v1/query" >"$outfile"; then
+        return 0
+      fi
+    else
+      if curl -sS --fail --max-time 60 --get --data-urlencode "query=$promql" "$base/api/v1/query" >"$outfile"; then
+        return 0
+      fi
+    fi
+  done
+  return 1
 }
 
 vm_query_range_to_file() {
@@ -1740,12 +2135,18 @@ vm_query_range_to_file() {
     printf '{"status":"error","data":{"result":[]}}' >"$outfile"
     return 0
   fi
-  curl -sS --fail --get \
-    --data-urlencode "query=$promql" \
-    --data-urlencode "start=$start_ts" \
-    --data-urlencode "end=$end_ts" \
-    --data-urlencode "step=$step_seconds" \
-    "$base/api/v1/query_range" >"$outfile"
+  local attempt
+  for attempt in 1 2 3; do
+    if curl -sS --fail --max-time 60 --get \
+      --data-urlencode "query=$promql" \
+      --data-urlencode "start=$start_ts" \
+      --data-urlencode "end=$end_ts" \
+      --data-urlencode "step=$step_seconds" \
+      "$base/api/v1/query_range" >"$outfile"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 DISK_USAGE_CSV=""
@@ -1838,16 +2239,11 @@ parse_vm_matrix_response_to_prometheus() {
   local metric_name="$4"
   local strip_port="${5:-false}"
   local static_labels="${6:-}"
-  awk -v DEST="$dest_prom" -v KEY_LABEL="$key_label" -v METRIC="$metric_name" -v STRIP_PORT="$strip_port" -v STATIC_LABELS="$static_labels" '
+  awk -v DEST="$dest_prom" -v METRIC="$metric_name" -v STRIP_PORT="$strip_port" -v STATIC_LABELS="$static_labels" '
   function esc(v) {
     gsub(/\\/, "\\\\", v)
     gsub(/"/, "\\\"", v)
     gsub(/\n/, "\\n", v)
-    return v
-  }
-  function trim(v) {
-    gsub(/^[[:space:]]+/, "", v)
-    gsub(/[[:space:]]+$/, "", v)
     return v
   }
   {
@@ -1858,18 +2254,19 @@ parse_vm_matrix_response_to_prometheus() {
     n = split(raw, parts, /\{"metric":/)
     for (i = 2; i <= n; i++) {
       chunk = "{\"metric\":" parts[i]
-      label_count = split(KEY_LABEL, label_keys, ",")
       labels = ""
-      for (k = 1; k <= label_count; k++) {
-        lk = trim(label_keys[k])
-        if (lk == "") {
+      values_pos = index(chunk, "\"values\":[")
+      if (values_pos == 0) {
+        continue
+      }
+      metric_part = substr(chunk, 0, values_pos)
+      while (match(metric_part, /"([^"]+)":"([^"]*)"/, m)) {
+        lk = m[1]
+        lv = m[2]
+        if (lk == "__name__") {
+          metric_part = substr(metric_part, RSTART + RLENGTH)
           continue
         }
-        if (!match(chunk, "\"" lk "\":\"([^\"]+)\"", m)) {
-          labels = ""
-          break
-        }
-        lv = m[1]
         if (STRIP_PORT == "true" && lk == "instance") {
           sub(/:.*/, "", lv)
         }
@@ -1877,9 +2274,7 @@ parse_vm_matrix_response_to_prometheus() {
           labels = labels ","
         }
         labels = labels lk "=\"" esc(lv) "\""
-      }
-      if (labels == "") {
-        continue
+        metric_part = substr(metric_part, RSTART + RLENGTH)
       }
       values_pos = index(chunk, "\"values\":[")
       if (values_pos == 0) {
@@ -1955,6 +2350,7 @@ vm_fetch_range_prometheus() {
   rm -f "$json_tmp"
 }
 
+BUSINESS_WRITES_START_TS=$(date +%s)
 log "Collecting business table write statistics from VictoriaMetrics (Prom format)"
 BUSINESS_STEP_SECONDS=$((BUCKET_INTERVAL_MINUTES * 60))
 if (( BUSINESS_STEP_SECONDS <= 0 )); then
@@ -1985,6 +2381,8 @@ STATIC_BUSINESS_LABELS=$(printf 'chi="%s",ck_cluster="%s",db="%s",processName="n
   "$(prom_escape_label_value "$CK_CLUSTER_NAME")" \
   "$(prom_escape_label_value "$CK_DATABASE_BUSINESS")")
 vm_fetch_range_prometheus "$BUSINESS_WRITES_PROMQL" "$BUSINESS_RANGE_START_TS" "$BUSINESS_RANGE_END_TS" "$BUSINESS_STEP_SECONDS" "$BUSINESS_WRITES_PROM" "logType" "sr_migration_business_table_written_rows" "false" "$STATIC_BUSINESS_LABELS"
+BUSINESS_WRITES_END_TS=$(date +%s)
+log_collector_stats "business_table_writes" "$BUSINESS_WRITES_PROM" "$BUSINESS_WRITES_START_TS" "$BUSINESS_WRITES_END_TS"
 
 VM_STEP_SECONDS=$((VM_BUCKET_INTERVAL_MINUTES * 60))
 if (( VM_STEP_SECONDS <= 0 )); then
@@ -2007,6 +2405,7 @@ VM_BUCKET_WINDOW="${VM_BUCKET_INTERVAL_MINUTES}m"
 # CK Pod 级别资源分时序列（来自 VM）
 CK_POD_TIMESERIES_PROM="$TIMESERIES_DIR/ck_pod_usage_timeseries.prom"
 : >"$CK_POD_TIMESERIES_PROM"
+CK_POD_METRICS_START_TS=$(date +%s)
 log "Collecting CK Pod metrics from VM (Namespace: $CK_K8S_NAMESPACE)"
 log "Discovering pods in namespace: $CK_K8S_NAMESPACE"
 DISCOVERED_PODS=$(kubectl get pods -n "$CK_K8S_NAMESPACE" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr -s '[:space:]' ' ' || echo "")
@@ -2022,6 +2421,7 @@ else
 fi
 CK_POD_CPU_BASE=$(printf 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="%s", container!="POD", container!=""}[%s])) * 100' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
 CK_POD_MEM_BASE=$(printf 'sum by (pod) (container_memory_working_set_bytes{namespace="%s", container!="POD", container!=""})' "$CK_K8S_NAMESPACE")
+CK_POD_MEM_USAGE_BASE=$(printf 'sum by (pod) (container_memory_usage_bytes{namespace="%s", container!="POD", container!=""})' "$CK_K8S_NAMESPACE")
 CK_POD_NET_RX_BASE=$(printf 'sum by (pod) (rate(container_network_receive_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
 CK_POD_NET_TX_BASE=$(printf 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
 CK_POD_DISK_R_BASE=$(printf 'sum by (pod) (rate(container_fs_reads_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
@@ -2031,6 +2431,8 @@ CK_POD_CPU_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_cpu_usage_seconds_t
 CK_POD_CPU_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_CPU_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
 CK_POD_MEM_AVG_PROMQL=$(printf 'sum by (pod) (avg_over_time(container_memory_working_set_bytes{namespace="%s", container!="POD", container!=""}[%s]))' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_MEM_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_MEM_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_POD_MEM_USAGE_AVG_PROMQL=$(printf 'sum by (pod) (avg_over_time(container_memory_usage_bytes{namespace="%s", container!="POD", container!=""}[%s]))' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
+CK_POD_MEM_USAGE_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_MEM_USAGE_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
 CK_POD_NET_RX_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_network_receive_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_NET_RX_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_NET_RX_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
 CK_POD_NET_TX_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
@@ -2055,6 +2457,8 @@ vm_fetch_range_prometheus "$CK_POD_CPU_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_R
 vm_fetch_range_prometheus "$CK_POD_CPU_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_cpu_usage_percent_max" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_MEM_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_memory_usage_bytes_avg" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_MEM_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_memory_usage_bytes_max" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_MEM_USAGE_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_memory_usage_bytes_total_avg" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_MEM_USAGE_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_memory_usage_bytes_total_max" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_NET_RX_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_net_rx_mbps_avg" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_NET_RX_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_net_rx_mbps_max" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_NET_TX_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_net_tx_mbps_avg" "false" "$STATIC_POD_LABELS"
@@ -2065,9 +2469,12 @@ vm_fetch_range_prometheus "$CK_POD_DISK_W_AVG_PROMQL" "$POD_RANGE_START_TS" "$PO
 vm_fetch_range_prometheus "$CK_POD_DISK_W_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_disk_write_mbps_max" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_THROTTLE_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_cpu_throttle_percent_avg" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_THROTTLE_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_cpu_throttle_percent_max" "false" "$STATIC_POD_LABELS"
+CK_POD_METRICS_END_TS=$(date +%s)
+log_collector_stats "ck_pod_usage_timeseries" "$CK_POD_TIMESERIES_PROM" "$CK_POD_METRICS_START_TS" "$CK_POD_METRICS_END_TS"
 
 CK_METRICS_TIMESERIES_PROM="$TIMESERIES_DIR/clickhouse_metrics_timeseries.prom"
 : >"$CK_METRICS_TIMESERIES_PROM"
+CK_METRICS_START_TS=$(date +%s)
 CK_METRICS_EXTRA_MATCHERS=""
 if [[ -n "$VM_CK_POD_SELECTOR" ]]; then
   CK_METRICS_EXTRA_MATCHERS=",$VM_CK_POD_SELECTOR"
@@ -2136,10 +2543,13 @@ vm_fetch_range_prometheus "$CK_PG_CONNECTION_AVG_PROMQL" "$POD_RANGE_START_TS" "
 vm_fetch_range_prometheus "$CK_PG_CONNECTION_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_postgresql_connections_max" "true" "$STATIC_CK_METRICS_LABELS"
 vm_fetch_range_prometheus "$CK_INTERSERVER_CONNECTION_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_interserver_connections_avg" "true" "$STATIC_CK_METRICS_LABELS"
 vm_fetch_range_prometheus "$CK_INTERSERVER_CONNECTION_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_METRICS_TIMESERIES_PROM" "instance" "sr_migration_clickhouse_metrics_interserver_connections_max" "true" "$STATIC_CK_METRICS_LABELS"
+CK_METRICS_END_TS=$(date +%s)
+log_collector_stats "clickhouse_metrics_timeseries" "$CK_METRICS_TIMESERIES_PROM" "$CK_METRICS_START_TS" "$CK_METRICS_END_TS"
 
 # 集群所有节点资源分时序列（来自 VM）
 NODE_CLUSTER_TIMESERIES_PROM="$TIMESERIES_DIR/cluster_node_usage_timeseries.prom"
 : >"$NODE_CLUSTER_TIMESERIES_PROM"
+NODE_CLUSTER_START_TS=$(date +%s)
 CLUSTER_INSTANCE_SELECTOR=""
 CLUSTER_TARGET_LABEL=""
 if [[ -n "$VM_NODE_SELECTOR" ]]; then
@@ -2235,6 +2645,8 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   vm_fetch_range_prometheus "$CLUSTER_NET_RX_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_net_rx_mbps_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_NET_TX_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_net_tx_mbps_avg" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_NET_TX_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_net_tx_mbps_max" "true" "$STATIC_NODE_LABELS"
+  NODE_CLUSTER_END_TS=$(date +%s)
+  log_collector_stats "cluster_node_usage_timeseries" "$NODE_CLUSTER_TIMESERIES_PROM" "$NODE_CLUSTER_START_TS" "$NODE_CLUSTER_END_TS"
 else
   log "WARNING: No VM node selector provided AND failed to discover node IPs. Skipping cluster node usage timeseries"
 fi
@@ -2242,6 +2654,7 @@ fi
 CLUSTER_FILESYSTEM_TIMESERIES_PROM="$TIMESERIES_DIR/cluster_filesystem_usage_timeseries.prom"
 : >"$CLUSTER_FILESYSTEM_TIMESERIES_PROM"
 if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
+  FS_TIMESERIES_START_TS=$(date +%s)
   log "Collecting cluster filesystem timeseries from VictoriaMetrics"
   FS_SELECTOR=$(build_cluster_selector 'fstype!~"tmpfs|overlay|shm|autofs|cgroup|nsfs"')
   FS_TOTAL_PROMQL=$(printf "node_filesystem_size_bytes%s" "$FS_SELECTOR")
@@ -2260,6 +2673,8 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   vm_fetch_range_prometheus "$FS_FREE_PROMQL" "$FS_RANGE_START_TS" "$FS_RANGE_END_TS" "$VM_STEP_SECONDS" "$CLUSTER_FILESYSTEM_TIMESERIES_PROM" "instance,mountpoint" "sr_migration_cluster_filesystem_free_bytes" "true" "$STATIC_FS_LABELS"
   vm_fetch_range_prometheus "$FS_USED_BYTES_PROMQL" "$FS_RANGE_START_TS" "$FS_RANGE_END_TS" "$VM_STEP_SECONDS" "$CLUSTER_FILESYSTEM_TIMESERIES_PROM" "instance,mountpoint" "sr_migration_cluster_filesystem_used_bytes" "true" "$STATIC_FS_LABELS"
   vm_fetch_range_prometheus "$FS_USED_PCT_PROMQL" "$FS_RANGE_START_TS" "$FS_RANGE_END_TS" "$VM_STEP_SECONDS" "$CLUSTER_FILESYSTEM_TIMESERIES_PROM" "instance,mountpoint" "sr_migration_cluster_filesystem_used_percent" "true" "$STATIC_FS_LABELS"
+  FS_TIMESERIES_END_TS=$(date +%s)
+  log_collector_stats "cluster_filesystem_usage_timeseries" "$CLUSTER_FILESYSTEM_TIMESERIES_PROM" "$FS_TIMESERIES_START_TS" "$FS_TIMESERIES_END_TS"
 else
   log "WARNING: No VM node selector provided AND failed to discover node IPs. Skipping filesystem timeseries"
 fi
@@ -2311,7 +2726,9 @@ TRAFFIC_JSON=$(cat <<EOF
   "query_log_latency_timeseries_by_user_group_csv": $(json_string "$QUERY_LOG_LATENCY_BY_USER_GROUP_CSV"),
   "slow_queries_csv": $(json_string "$SLOW_QUERIES_CSV"),
   "slow_queries_by_user_group_csv": $(json_string "$SLOW_QUERIES_BY_USER_GROUP_CSV"),
-  "query_time_range_distribution_by_user_group_csv": $(json_string "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV")
+  "query_time_range_distribution_by_user_group_csv": $(json_string "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"),
+  "query_time_range_distribution_strict_csv": $(json_string "$QUERY_TIME_RANGE_STRICT_CSV"),
+  "query_time_range_distribution_strict_by_user_group_csv": $(json_string "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV")
 }
 EOF
 )
@@ -2560,3 +2977,16 @@ if [[ "$COMPRESS_OUTPUT" == "true" ]]; then
     log "ERROR: Compression failed. Original directory preserved at: $OUTPUT_DIR"
   fi
 fi
+
+SCRIPT_END_TS=$(date +%s)
+if (( SCRIPT_END_TS < SCRIPT_START_TS )); then
+  SCRIPT_END_TS=$SCRIPT_START_TS
+fi
+SCRIPT_DURATION_S=$((SCRIPT_END_TS - SCRIPT_START_TS))
+SCRIPT_DURATION_MIN=$(awk -v s="$SCRIPT_DURATION_S" 'BEGIN{printf "%.2f", s/60}')
+ARCHIVE_SIZE_MB="N/A"
+if [[ "$COMPRESS_OUTPUT" == "true" && -n "${ARCHIVE_NAME:-}" && -e "$ARCHIVE_NAME" ]]; then
+  ARCHIVE_BYTES=$(wc -c <"$ARCHIVE_NAME" 2>/dev/null || echo 0)
+  ARCHIVE_SIZE_MB=$(awk -v b="$ARCHIVE_BYTES" 'BEGIN{printf "%.2f", b/1024/1024}')
+fi
+log "Script finished. duration_min=${SCRIPT_DURATION_MIN} archive_size_mb=${ARCHIVE_SIZE_MB} output=${ARCHIVE_NAME:-$OUTPUT_DIR}"
