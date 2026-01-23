@@ -1553,7 +1553,6 @@ SQL
     QUERY_TIME_RANGE_END_TS=$(date +%s)
     log_collector_stats "query_time_range_distribution" "$QUERY_TIME_RANGE_CSV" "$QUERY_TIME_RANGE_START_TS" "$QUERY_TIME_RANGE_END_TS"
 
-    QUERY_TIME_RANGE_BY_USER_GROUP_CSV="$OUTPUT_DIR/query_time_range_distribution_by_user_group.csv"
     if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
       echo "user_group,table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"
       QUERY_TIME_RANGE_BY_USER_GROUP_SQL=$(cat <<SQL
@@ -1719,7 +1718,6 @@ SQL
     log_collector_stats "query_time_range_distribution_by_user_group" "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV" "$QUERY_TIME_RANGE_START_TS" "$QUERY_TIME_RANGE_BY_USER_GROUP_END_TS"
   fi
 
-    QUERY_TIME_RANGE_STRICT_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict.csv"
     echo "table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_CSV"
     QUERY_TIME_RANGE_STRICT_START_TS=$(date +%s)
     QUERY_TIME_RANGE_STRICT_SQL=$(cat <<SQL
@@ -1855,7 +1853,6 @@ SQL
     log_collector_stats "query_time_range_distribution_strict" "$QUERY_TIME_RANGE_STRICT_CSV" "$QUERY_TIME_RANGE_STRICT_START_TS" "$QUERY_TIME_RANGE_STRICT_END_TS"
 
     if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
-      QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV="$OUTPUT_DIR/query_time_range_distribution_strict_by_user_group.csv"
       echo "user_group,table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
       QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_SQL=$(cat <<SQL
 WITH
