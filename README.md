@@ -3,30 +3,22 @@
 ## 默认使用
 
 ```bash
-  ./collect.sh \
-    --business-time-config ./business_time_config.yaml \
-    --resource-history-days "$d" \
-    --query-time-range-days "$d" \
-    --vm-service "vmselect-vmcluster" \
-    --vm-namespace "monitor-platform" \
-    --output-dir "./migration_report_${d}"
+./collect.sh 
 ```
 
-## 参数
+## 可选参数
 
 ```bash
 Usage: ./collect.sh [options]
 
-Required options:
-  --business-time-config PATH        Business table time column config file (YAML/JSON)
-
 Optional options:
+  --business-time-config PATH        Business table time column config file (default "./business_time_config.yaml" or BUSINESS_TIME_CONFIG)
   --ck-user USER                     ClickHouse user (default "root" or CK_USER)
   --ck-password PASSWORD             ClickHouse password (or set CK_PASSWORD; default from k8s secret root)
   --ck-database-business NAME        Business database name (default "business" or CK_DATABASE_BUSINESS)
   --bucket-interval-minutes MINS     Bucket interval for time series stats (default 30 or BUCKET_INTERVAL_MINUTES)
-  --resource-history-days DAYS       Lookback window for node metrics and query_log stats (default 30 or RESOURCE_HISTORY_DAYS)
-  --query-time-range-days DAYS       Lookback window for time range stats (default 30 or QUERY_TIME_RANGE_DAYS)
+  --resource-history-days DAYS       Lookback window for node metrics and query_log stats (default 7 or RESOURCE_HISTORY_DAYS)
+  --query-time-range-days DAYS       Lookback window for time range stats (default 7 or QUERY_TIME_RANGE_DAYS)
   --query-time-range-max-threads N   max_threads for time range query (default 2 or QUERY_TIME_RANGE_MAX_THREADS)
   --query-time-range-max-seconds N   max_execution_time seconds (default 300 or QUERY_TIME_RANGE_MAX_SECONDS)
   --ck-k8s-namespace NAME            Kubernetes namespace containing the ClickHouse pod (ck or set CK_K8S_NAMESPACE)
@@ -44,7 +36,7 @@ Optional options:
   --chi-name NAME                    ClickHouseInstallation name (default "pro" or CHI_NAME)
   --compress-output true|false       Whether to tar.gz the final output directory (default true or COMPRESS_OUTPUT)
   --debug true|false                 Enable debug collectors (default false or DEBUG)
-  --output-dir PATH                  Custom output directory (default ./output)
+  --output-dir PATH                  Custom output directory (default "./migration_report" or OUTPUT_DIR)
 
 Environment variables listed in the options above act as defaults for the options above.
 The script prints the aggregated JSON payload to stdout once all collectors finish.
