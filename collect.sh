@@ -7,16 +7,14 @@ usage() {
   cat <<'EOF'
 Usage: ./collect.sh [options]
 
-Required options:
-  --business-time-config PATH        Business table time column config file (YAML/JSON)
-
 Optional options:
+  --business-time-config PATH        Business table time column config file (default "./business_time_config.yaml" or BUSINESS_TIME_CONFIG)
   --ck-user USER                     ClickHouse user (default "root" or CK_USER)
   --ck-password PASSWORD             ClickHouse password (or set CK_PASSWORD; default from k8s secret root)
   --ck-database-business NAME        Business database name (default "business" or CK_DATABASE_BUSINESS)
   --bucket-interval-minutes MINS     Bucket interval for time series stats (default 30 or BUCKET_INTERVAL_MINUTES)
-  --resource-history-days DAYS       Lookback window for node metrics and query_log stats (default 30 or RESOURCE_HISTORY_DAYS)
-  --query-time-range-days DAYS       Lookback window for time range stats (default 30 or QUERY_TIME_RANGE_DAYS)
+  --resource-history-days DAYS       Lookback window for node metrics and query_log stats (default 7 or RESOURCE_HISTORY_DAYS)
+  --query-time-range-days DAYS       Lookback window for time range stats (default 7 or QUERY_TIME_RANGE_DAYS)
   --query-time-range-max-threads N   max_threads for time range query (default 2 or QUERY_TIME_RANGE_MAX_THREADS)
   --query-time-range-max-seconds N   max_execution_time seconds (default 300 or QUERY_TIME_RANGE_MAX_SECONDS)
   --ck-k8s-namespace NAME            Kubernetes namespace containing the ClickHouse pod (ck or set CK_K8S_NAMESPACE)
@@ -34,7 +32,7 @@ Optional options:
   --chi-name NAME                    ClickHouseInstallation name (default "pro" or CHI_NAME)
   --compress-output true|false       Whether to tar.gz the final output directory (default true or COMPRESS_OUTPUT)
   --debug true|false                 Enable debug collectors (default false or DEBUG)
-  --output-dir PATH                  Custom output directory (default ./output)
+  --output-dir PATH                  Custom output directory (default "./migration_report" or OUTPUT_DIR)
 
 Environment variables listed in the options above act as defaults for the options above.
 The script prints the aggregated JSON payload to stdout once all collectors finish.
@@ -133,14 +131,14 @@ CK_USER="${CK_USER:-}"
 CK_PASSWORD="${CK_PASSWORD:-}"
 CK_DATABASE_BUSINESS="${CK_DATABASE_BUSINESS:-business}"
 BUCKET_INTERVAL_MINUTES="${BUCKET_INTERVAL_MINUTES:-30}"
-RESOURCE_HISTORY_DAYS="${RESOURCE_HISTORY_DAYS:-30}"
-QUERY_TIME_RANGE_DAYS="${QUERY_TIME_RANGE_DAYS:-30}"
+RESOURCE_HISTORY_DAYS="${RESOURCE_HISTORY_DAYS:-7}"
+QUERY_TIME_RANGE_DAYS="${QUERY_TIME_RANGE_DAYS:-7}"
 QUERY_TIME_RANGE_MAX_THREADS="${QUERY_TIME_RANGE_MAX_THREADS:-2}"
 QUERY_TIME_RANGE_MAX_SECONDS="${QUERY_TIME_RANGE_MAX_SECONDS:-300}"
 COMPRESS_OUTPUT="${COMPRESS_OUTPUT:-true}"
 DEBUG="${DEBUG:-false}"
-OUTPUT_DIR="${OUTPUT_DIR:-}"
-BUSINESS_TIME_CONFIG="${BUSINESS_TIME_CONFIG:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-./migration_report}"
+BUSINESS_TIME_CONFIG="${BUSINESS_TIME_CONFIG:-./business_time_config.yaml}"
 VM_SERVICE="${VM_SERVICE:-vmselect-vmcluster}"
 VM_NAMESPACE="${VM_NAMESPACE:-monitor-platform}"
 VM_PORT="${VM_PORT:-8481}"
@@ -274,10 +272,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$BUSINESS_TIME_CONFIG" ]]; then
-  >&2 echo "ERROR: --business-time-config or BUSINESS_TIME_CONFIG is required"
-  exit 1
-fi
 if [[ -z "$CK_K8S_NAMESPACE" ]]; then
   >&2 echo "ERROR: --ck-k8s-namespace or CK_K8S_NAMESPACE is required"
   exit 1
@@ -359,7 +353,7 @@ if ! [[ "$VM_RATE_WINDOW" =~ ^[0-9]+[smhdwy]([0-9]+[smhdwy])*$ ]]; then
   exit 1
 fi
 if [[ -z "$OUTPUT_DIR" ]]; then
-  OUTPUT_DIR="$(pwd)/output"
+  OUTPUT_DIR="./migration_report"
 fi
 # 准备输出目录结构：主目录 + 各种 timeseries 子目录
 mkdir -p "$OUTPUT_DIR"
