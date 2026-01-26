@@ -33,6 +33,7 @@ Optional options:
   --vm-ck-pod-selector SELECTOR      Selector snippet injected into CK pod PromQL
   --chi-name NAME                    ClickHouseInstallation name (default "pro" or CHI_NAME)
   --compress-output true|false       Whether to tar.gz the final output directory (default true or COMPRESS_OUTPUT)
+  --debug true|false                 Enable debug collectors (default false or DEBUG)
   --output-dir PATH                  Custom output directory (default ./output)
 
 Environment variables listed in the options above act as defaults for the options above.
@@ -137,6 +138,7 @@ QUERY_TIME_RANGE_DAYS="${QUERY_TIME_RANGE_DAYS:-30}"
 QUERY_TIME_RANGE_MAX_THREADS="${QUERY_TIME_RANGE_MAX_THREADS:-2}"
 QUERY_TIME_RANGE_MAX_SECONDS="${QUERY_TIME_RANGE_MAX_SECONDS:-300}"
 COMPRESS_OUTPUT="${COMPRESS_OUTPUT:-true}"
+DEBUG="${DEBUG:-false}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 BUSINESS_TIME_CONFIG="${BUSINESS_TIME_CONFIG:-}"
 VM_SERVICE="${VM_SERVICE:-vmselect-vmcluster}"
@@ -190,6 +192,15 @@ while [[ $# -gt 0 ]]; do
     --compress-output)
       COMPRESS_OUTPUT="$2"
       shift 2
+      ;;
+    --debug)
+      if [[ $# -gt 1 && "${2:0:1}" != "-" ]]; then
+        DEBUG="$2"
+        shift 2
+      else
+        DEBUG="true"
+        shift 1
+      fi
       ;;
     --ck-helm-namespace)
       CK_HELM_NAMESPACE="$2"
@@ -287,8 +298,8 @@ fi
 # 组装 VictoriaMetrics Base URL (Cluster Mode)
 # 格式: http://{host}:{port}/select/{accountID}/prometheus
 # 后续函数会自动追加 /api/v1/query，最终形成 /select/{tenant}/prometheus/api/v1/query
-VM_BASE_URL="http://${VM_SERVICE}-0.${VM_SERVICE}.${VM_NAMESPACE}.svc.cluster.local:${VM_PORT}/select/${VM_TENANT_ID}/prometheus"
-log "Configured VictoriaMetrics URL: $VM_BASE_URL"
+VM_BASE_URL=""
+log "Configured VictoriaMetrics service: ${VM_SERVICE} (namespace: ${VM_NAMESPACE})"
 
 require_cmd kubectl
 require_cmd helm
@@ -356,8 +367,12 @@ TIMESERIES_DIR="$OUTPUT_DIR/timeseries"
 BUSINESS_WRITES_DIR="$TIMESERIES_DIR/business_table_writes"
 # BUSINESS_QUERY_LOG_WRITES_DIR="$TIMESERIES_DIR/query_log_writes"
 BUSINESS_QUERY_LOG_READS_DIR="$TIMESERIES_DIR/query_log_reads"
+QUERY_TIME_RANGE_STATEMENTS_DIR="$TIMESERIES_DIR/query_time_range_statements"
 SNAPSHOTS_DIR="$OUTPUT_DIR/snapshots"
 mkdir -p "$BUSINESS_WRITES_DIR" "$BUSINESS_QUERY_LOG_READS_DIR" "$SNAPSHOTS_DIR"
+if [[ "$DEBUG" == "true" ]]; then
+  mkdir -p "$QUERY_TIME_RANGE_STATEMENTS_DIR"
+fi
 # mkdir -p "$BUSINESS_WRITES_DIR" "$BUSINESS_QUERY_LOG_WRITES_DIR" "$BUSINESS_QUERY_LOG_READS_DIR" "$SNAPSHOTS_DIR"
 
 BUCKET_INTERVAL_MINUTES=$((BUCKET_INTERVAL_MINUTES))
@@ -388,56 +403,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
-start_vm_port_forward() {
-  local target
-  local attempt
-  local wait_step
-  local local_port
-  local log_file="$TMP_DIR/vm_port_forward.log"
-  for target in "pod/${VM_SERVICE}-0" "svc/${VM_SERVICE}"; do
-    for ((attempt=1; attempt<=30; attempt++)); do
-      local_port=$((20000 + RANDOM % 40000))
-      : >"$log_file"
-      kubectl -n "$VM_NAMESPACE" port-forward --address 127.0.0.1 "$target" "${local_port}:${VM_PORT}" >"$log_file" 2>&1 &
-      VM_PORT_FORWARD_PID=$!
-      for ((wait_step=1; wait_step<=50; wait_step++)); do
-        if grep -q "Forwarding from 127.0.0.1:${local_port}" "$log_file" || grep -q "Forwarding from \\[::1\\]:${local_port}" "$log_file"; then
-          VM_BASE_URL="http://127.0.0.1:${local_port}/select/${VM_TENANT_ID}/prometheus"
-          return 0
-        fi
-        if ! kill -0 "$VM_PORT_FORWARD_PID" 2>/dev/null; then
-          break
-        fi
-        sleep 0.1
-      done
-      kill "$VM_PORT_FORWARD_PID" 2>/dev/null || true
-      wait "$VM_PORT_FORWARD_PID" 2>/dev/null || true
-      VM_PORT_FORWARD_PID=""
-    done
-  done
+resolve_vmselect_pod_ip() {
+  local ip
+  ip=$(kubectl -n "$VM_NAMESPACE" get pod "${VM_SERVICE}-0" -o jsonpath='{.status.podIP}' 2>/dev/null || true)
+  if [[ -n "$ip" ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  ip=$(kubectl -n "$VM_NAMESPACE" get endpoints "$VM_SERVICE" -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null || true)
+  if [[ -n "$ip" ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  ip=$(kubectl -n "$VM_NAMESPACE" get endpointslice -l "kubernetes.io/service-name=${VM_SERVICE}" -o jsonpath='{.items[0].endpoints[0].addresses[0]}' 2>/dev/null || true)
+  if [[ -n "$ip" ]]; then
+    printf '%s' "$ip"
+    return 0
+  fi
   return 1
 }
 
 VM_ENABLED="true"
-log "Connecting to VictoriaMetrics via kubectl port-forward"
-if ! start_vm_port_forward; then
-  >&2 echo "ERROR: Failed to establish VictoriaMetrics port-forward."
-  if [[ -s "$TMP_DIR/vm_port_forward.log" ]]; then
-    >&2 echo "  port-forward log (last 20 lines):"
-    >&2 tail -n 20 "$TMP_DIR/vm_port_forward.log" | sed 's/^/  /'
-  fi
+log "Connecting to VictoriaMetrics via vmselect pod IP"
+VM_POD_IP=$(resolve_vmselect_pod_ip || true)
+if [[ -z "$VM_POD_IP" ]]; then
+  >&2 echo "ERROR: Failed to resolve vmselect pod IP in namespace ${VM_NAMESPACE} (service ${VM_SERVICE})."
   exit 1
 fi
+VM_BASE_URL="http://${VM_POD_IP}:${VM_PORT}/select/${VM_TENANT_ID}/prometheus"
 VM_BASE_URL_TRIMMED="${VM_BASE_URL%/}"
 if ! curl -sS --fail --get --data-urlencode "query=1" "${VM_BASE_URL_TRIMMED}/api/v1/query" >/dev/null 2>&1; then
-  >&2 echo "ERROR: VictoriaMetrics is not reachable after port-forward: $VM_BASE_URL"
-  if [[ -s "$TMP_DIR/vm_port_forward.log" ]]; then
-    >&2 echo "  port-forward log (last 20 lines):"
-    >&2 tail -n 20 "$TMP_DIR/vm_port_forward.log" | sed 's/^/  /'
-  fi
+  >&2 echo "ERROR: VictoriaMetrics is not reachable via pod IP: $VM_BASE_URL"
   exit 1
 fi
-log "VictoriaMetrics is reachable via port-forward: $VM_BASE_URL"
+log "VictoriaMetrics is reachable via pod IP: $VM_BASE_URL"
 
 CLICKHOUSE_CLIENT_BASE=(
   kubectl exec -i -n "$CK_K8S_NAMESPACE" "$CK_K8S_POD" --
@@ -533,6 +532,16 @@ run_clickhouse_to_csv() {
   fi
 }
 
+run_clickhouse_to_tsv() {
+  local sql="$1"
+  local outfile="$2"
+  if ! "${CLICKHOUSE_CLIENT_BASE[@]}" --format TSVWithNames --query "$sql" < /dev/null >"$outfile" 2>"$TMP_DIR/ch_err.log"; then
+    >&2 echo "ERROR: ClickHouse TSV query failed:"
+    >&2 sed 's/^/  /' "$TMP_DIR/ch_err.log"
+    return 1
+  fi
+}
+
 # 将库表名转换为安全的文件名
 sanitize_for_filename() {
   local name="${1//\//_}"
@@ -566,6 +575,30 @@ NR==1 {next}
     seen[file]=1
   }
   print $0 >> file
+}' "$src"
+}
+
+split_query_time_range_statements() {
+  local src="$1"
+  local dest_dir="$2"
+  mkdir -p "$dest_dir"
+  if [[ ! -s "$src" ]]; then
+    return
+  fi
+  awk -v dest="$dest_dir" '
+BEGIN {FS="\t"}
+NR==1 {next}
+{
+  db=$1; tbl=$2; matched=$3; stmt=$4;
+  gsub(/"/, "", db); gsub(/"/, "", tbl);
+  key=db "." tbl
+  gsub(/[^A-Za-z0-9._-]/, "_", key)
+  if (matched == "1") {
+    file = dest "/" key ".matched.log"
+  } else {
+    file = dest "/" key ".unmatched.log"
+  }
+  print stmt >> file
 }' "$src"
 }
 
@@ -1363,7 +1396,7 @@ QUERY_TIME_RANGE_CSV="$TIMESERIES_DIR/query_time_range_distribution.csv"
 QUERY_TIME_RANGE_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_time_range_distribution_by_user_group.csv"
 QUERY_TIME_RANGE_STRICT_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict.csv"
 QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict_by_user_group.csv"
-echo "table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_CSV"
+echo "table,query_count,matched_query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_CSV"
 : >"$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"
 : >"$QUERY_TIME_RANGE_STRICT_CSV"
 : >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
@@ -1388,12 +1421,14 @@ if ck_has_column "system" "query_log" "tables"; then
     TT_COLUMN_REGEX=$(printf '%s' "$TT_QUERY_COL" | sed -e 's/[\\.^$|()\[\]{}*+?]/\\\\&/g')
     TT_COLUMN_REGEX_CH=${TT_COLUMN_REGEX//\\/\\\\}
     TT_COLUMN_REGEX_SQL=${TT_COLUMN_REGEX_CH//\'/\'\'}
+    TT_COLUMN_REGEX_QUOTED="(?:[\\\`\\\"]?${TT_COLUMN_REGEX_SQL}[\\\`\\\"]?)"
+    TT_COLUMN_REGEX_FULL="(?:[\\\`\\\"]?[A-Za-z0-9_]+[\\\`\\\"]?\\\\.)*${TT_COLUMN_REGEX_QUOTED}"
     COND="(table_db = '$TT_DB_SQL' AND table_tbl = '$TT_TABLE_SQL')"
     IN_CONFIG_CASES+="$COND, 1, "
-    TS_START_CASES+="$COND, extractAll(ql.query, '(?i)\\\\b${TT_COLUMN_REGEX_SQL}\\\\b\\\\s*(?:>=|>)\\\\s*([0-9]{9,19})'), "
-    TS_END_CASES+="$COND, extractAll(ql.query, '(?i)\\\\b${TT_COLUMN_REGEX_SQL}\\\\b\\\\s*(?:<=|<)\\\\s*([0-9]{9,19})'), "
-    TS_START_DATE_CASES+="$COND, extractAll(ql.query, '(?i)\\\\b${TT_COLUMN_REGEX_SQL}\\\\b\\\\s*(?:>=|>)\\\\s*[^0-9]{0,32}((?:19|20)\\\\d{2}-\\\\d{2}-\\\\d{2})'), "
-    TS_END_DATE_CASES+="$COND, extractAll(ql.query, '(?i)\\\\b${TT_COLUMN_REGEX_SQL}\\\\b\\\\s*(?:<=|<)\\\\s*[^0-9]{0,32}((?:19|20)\\\\d{2}-\\\\d{2}-\\\\d{2})'), "
+    TS_START_CASES+="$COND, arrayConcat(extractAll(ql.query, '(?i)${TT_COLUMN_REGEX_FULL}\\\\s*(?:>=|>)\\\\s*([0-9]{9,19})'), extractAll(ql.query, '(?i)${TT_COLUMN_REGEX_FULL}\\\\s+BETWEEN\\\\s*([0-9]{9,19})\\\\s+AND')), "
+    TS_END_CASES+="$COND, arrayConcat(extractAll(ql.query, '(?i)${TT_COLUMN_REGEX_FULL}\\\\s*(?:<=|<)\\\\s*([0-9]{9,19})'), extractAll(ql.query, '(?i)${TT_COLUMN_REGEX_FULL}\\\\s+BETWEEN\\\\s*[0-9]{9,19}\\\\s+AND\\\\s*([0-9]{9,19})')), "
+    TS_START_DATE_CASES+="$COND, arrayConcat(extractAll(ql.query, '(?i)${TT_COLUMN_REGEX_FULL}\\\\s*(?:>=|>)\\\\s*[^0-9]{0,32}((?:19|20)\\\\d{2}-\\\\d{2}-\\\\d{2})'), extractAll(ql.query, '(?i)${TT_COLUMN_REGEX_FULL}\\\\s+BETWEEN\\\\s*[^0-9]{0,32}((?:19|20)\\\\d{2}-\\\\d{2}-\\\\d{2})\\\\b')), "
+    TS_END_DATE_CASES+="$COND, arrayConcat(extractAll(ql.query, '(?i)${TT_COLUMN_REGEX_FULL}\\\\s*(?:<=|<)\\\\s*[^0-9]{0,32}((?:19|20)\\\\d{2}-\\\\d{2}-\\\\d{2})'), extractAll(ql.query, '(?i)${TT_COLUMN_REGEX_FULL}\\\\s+BETWEEN\\\\s*[^0-9]{0,32}(?:19|20)\\\\d{2}-\\\\d{2}-\\\\d{2}\\\\b[^0-9]{0,32}AND\\\\s*[^0-9]{0,32}((?:19|20)\\\\d{2}-\\\\d{2}-\\\\d{2})\\\\b')), "
   done <"$BUSINESS_TIME_TARGETS_FILE"
 
   if [[ -z "$IN_CONFIG_CASES" ]]; then
@@ -1511,6 +1546,7 @@ FROM
   SELECT
     table_name,
     count() AS query_count,
+    countIf(estimated_days_range > 0) AS matched_query_count,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
@@ -1529,6 +1565,7 @@ FROM
   SELECT
     '__ALL__' AS table_name,
     count() AS query_count,
+    countIf(estimated_days_range > 0) AS matched_query_count,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
@@ -1553,8 +1590,136 @@ SQL
     QUERY_TIME_RANGE_END_TS=$(date +%s)
     log_collector_stats "query_time_range_distribution" "$QUERY_TIME_RANGE_CSV" "$QUERY_TIME_RANGE_START_TS" "$QUERY_TIME_RANGE_END_TS"
 
+    if [[ "$DEBUG" == "true" ]]; then
+      QUERY_TIME_RANGE_STATEMENTS_TSV="$TMP_DIR/query_time_range_statements.tsv"
+      QUERY_TIME_RANGE_STATEMENTS_SQL=$(cat <<SQL
+WITH
+    per_query AS (
+      SELECT *
+      FROM
+      (
+        SELECT
+          ql.event_time,
+          $TABLE_DB_EXPR,
+          $TABLE_TBL_EXPR,
+          multiIf($IN_CONFIG_CASES 0) AS in_config,
+          replaceAll(replaceAll(ql.query, '\\t', ' '), '\\n', ' ') AS query_text,
+          extractAll(ql.query, '(?i)INTERVAL\\s+(\\d+)\\s+DAY') AS interval_days_matches,
+          extractAll(ql.query, '(?i)INTERVAL\\s+(\\d+)\\s+HOUR') AS interval_hours_matches,
+          extractAll(ql.query, '(\\d{4}-\\d{2}-\\d{2})') AS all_date_strs,
+          extractAll(ql.query, '(?i)(?:>|>=)[^0-9]{0,32}(\\d{4}-\\d{2}-\\d{2})') AS greater_than_matches,
+          multiIf($TS_START_CASES []) AS ts_start_matches,
+          multiIf($TS_END_CASES []) AS ts_end_matches,
+          multiIf($TS_START_DATE_CASES []) AS date_start_matches,
+          multiIf($TS_END_DATE_CASES []) AS date_end_matches
+        FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log) AS ql
+        ARRAY JOIN ql.tables AS t
+        WHERE
+          ql.event_time >= now() - INTERVAL {query_time_range_days:Int32} DAY
+          $QUERY_LOG_FILTER
+          AND ql.type = 'QueryFinish'
+          AND ql.is_initial_query = 1
+          AND ql.query_kind = 'Select'
+          AND has(ql.databases, {CK_DATABASE_BUSINESS:String})
+          AND (
+            startsWith(t, concat({CK_DATABASE_BUSINESS:String}, '.'))
+            OR
+            (position(t, '.') = 0 AND has(ql.databases, {CK_DATABASE_BUSINESS:String}))
+          )
+      )
+      WHERE in_config = 1
+    ),
+    per_query_ranges AS (
+      SELECT
+        table_db,
+        table_tbl,
+        query_text,
+        multiIf(
+          ts_start_dt > toDateTime(0) AND ts_end_dt > toDateTime(0) AND ts_end_dt >= ts_start_dt,
+            greatest(1.0, dateDiff('second', ts_start_dt, ts_end_dt) / 86400.0),
+          ts_start_dt > toDateTime(0),
+            greatest(1.0, dateDiff('second', ts_start_dt, event_time) / 86400.0),
+          date_start_dt > toDateTime(0) AND date_end_dt > toDateTime(0) AND date_end_dt >= date_start_dt,
+            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(date_end_dt)) + 1)),
+          date_start_dt > toDateTime(0),
+            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(event_time)) + 1)),
+          length(interval_days_matches) > 0,
+            toFloat64(arrayMax(arrayMap(x -> toInt64OrZero(x), interval_days_matches))),
+          length(interval_hours_matches) > 0,
+            toFloat64(arrayMax(arrayMap(x -> toInt64OrZero(x), interval_hours_matches))) / 24.0,
+          length(start_daynums) > 0,
+            greatest(1.0, toFloat64(toRelativeDayNum(toDate(event_time)) - arrayMax(start_daynums) + 1)),
+          length(valid_daynums) >= 2,
+            greatest(1.0, toFloat64(arrayMax(valid_daynums) - arrayMin(valid_daynums) + 1)),
+          0.0
+        ) AS estimated_days_range
+      FROM
+      (
+        SELECT
+          event_time,
+          table_db,
+          table_tbl,
+          query_text,
+          interval_days_matches,
+          interval_hours_matches,
+          all_date_strs,
+          greater_than_matches,
+          ts_start_matches,
+          ts_end_matches,
+          date_start_matches,
+          date_end_matches,
+          if(length(ts_start_matches) > 0, arrayMax(arrayMap(x -> toInt64OrZero(x), ts_start_matches)), toInt64(0)) AS ts_start_raw,
+          if(
+            length(ts_end_matches) > 0,
+            if(
+              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches)) = toInt64(9223372036854775807),
+              toInt64(0),
+              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches))
+            ),
+            toInt64(0)
+          ) AS ts_end_raw,
+          if(ts_start_raw > 0, toDateTime(ts_start_raw), toDateTime(0)) AS ts_start_dt,
+          if(ts_end_raw > 0, toDateTime(ts_end_raw), toDateTime(0)) AS ts_end_dt,
+          arrayFilter(d -> d > toDate(0), arrayMap(x -> toDateOrZero(x), all_date_strs)) AS valid_dates,
+          arrayMap(d -> toRelativeDayNum(d), valid_dates) AS valid_daynums,
+          arrayFilter(d -> d > toDate(0), arrayMap(x -> toDateOrZero(extract(x, '\\d{4}-\\d{2}-\\d{2}')), greater_than_matches)) AS start_dates,
+          arrayMap(d -> toRelativeDayNum(d), start_dates) AS start_daynums,
+          if(length(date_start_matches) > 0, arrayMax(arrayMap(x -> toInt32(toRelativeDayNum(toDateOrZero(x))), date_start_matches)), toInt32(0)) AS date_start_daynum,
+          if(
+            length(date_end_matches) > 0,
+            if(
+              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches)) = toInt32(2147483647),
+              toInt32(0),
+              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches))
+            ),
+            toInt32(0)
+          ) AS date_end_daynum,
+          if(date_start_daynum > 0, toDateTime(addDays(toDate(0), date_start_daynum)), toDateTime(0)) AS date_start_dt,
+          if(date_end_daynum > 0, toDateTime(addDays(toDate(0), date_end_daynum)), toDateTime(0)) AS date_end_dt
+        FROM per_query
+      )
+    )
+SELECT
+  table_db,
+  table_tbl,
+  toUInt8(estimated_days_range > 0) AS matched,
+  query_text
+FROM per_query_ranges
+ORDER BY table_db, table_tbl
+SETTINGS
+  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
+  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
+SQL
+)
+      if ! run_clickhouse_to_tsv "$QUERY_TIME_RANGE_STATEMENTS_SQL" "$QUERY_TIME_RANGE_STATEMENTS_TSV"; then
+        log "WARNING: Failed to collect query time range statements"
+      else
+        split_query_time_range_statements "$QUERY_TIME_RANGE_STATEMENTS_TSV" "$QUERY_TIME_RANGE_STATEMENTS_DIR"
+      fi
+    fi
+
     if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
-      echo "user_group,table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"
+      echo "user_group,table,query_count,matched_query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"
       QUERY_TIME_RANGE_BY_USER_GROUP_SQL=$(cat <<SQL
 WITH
     per_query AS (
@@ -1670,6 +1835,7 @@ FROM
     user_group,
     table_name,
     count() AS query_count,
+    countIf(estimated_days_range > 0) AS matched_query_count,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
@@ -1689,6 +1855,7 @@ FROM
     user_group,
     '__ALL__' AS table_name,
     count() AS query_count,
+    countIf(estimated_days_range > 0) AS matched_query_count,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
@@ -1718,7 +1885,7 @@ SQL
     log_collector_stats "query_time_range_distribution_by_user_group" "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV" "$QUERY_TIME_RANGE_START_TS" "$QUERY_TIME_RANGE_BY_USER_GROUP_END_TS"
   fi
 
-    echo "table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_CSV"
+    echo "table,query_count,matched_query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_CSV"
     QUERY_TIME_RANGE_STRICT_START_TS=$(date +%s)
     QUERY_TIME_RANGE_STRICT_SQL=$(cat <<SQL
 WITH
@@ -1810,6 +1977,7 @@ FROM
   SELECT
     table_name,
     count() AS query_count,
+    countIf(estimated_days_range > 0) AS matched_query_count,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
@@ -1828,6 +1996,7 @@ FROM
   SELECT
     '__ALL__' AS table_name,
     count() AS query_count,
+    countIf(estimated_days_range > 0) AS matched_query_count,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
@@ -1853,7 +2022,7 @@ SQL
     log_collector_stats "query_time_range_distribution_strict" "$QUERY_TIME_RANGE_STRICT_CSV" "$QUERY_TIME_RANGE_STRICT_START_TS" "$QUERY_TIME_RANGE_STRICT_END_TS"
 
     if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
-      echo "user_group,table,query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
+      echo "user_group,table,query_count,matched_query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
       QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_SQL=$(cat <<SQL
 WITH
     per_query AS (
@@ -1948,6 +2117,7 @@ FROM
     user_group,
     table_name,
     count() AS query_count,
+    countIf(estimated_days_range > 0) AS matched_query_count,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
@@ -1967,6 +2137,7 @@ FROM
     user_group,
     '__ALL__' AS table_name,
     count() AS query_count,
+    countIf(estimated_days_range > 0) AS matched_query_count,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
     toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
