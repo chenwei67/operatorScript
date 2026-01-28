@@ -1,0 +1,75 @@
+{
+  "cluster_overview": {
+  "ck_version": "23.2.5.110",
+  "cluster_node_count": 4,
+  "chi_shards_count": 4,
+  "chi_replicas_count": 1,
+  "chi_expected_node_count": 4
+},
+  "tables": {
+  "all_tables_stats_csv": "./migration_report/table_stats.csv",
+  "all_tables_schema_csv": "./migration_report/table_schema.csv",
+  "business_ttl_csv": "./migration_report/business_ttl.csv",
+  "views_ddl_csv": "./migration_report/views_ddl.csv",
+  "business_table_writes_dir": "./migration_report/timeseries/business_table_writes"
+},
+  "schemas": {
+  "all_tables_schema_csv": "./migration_report/table_schema.csv"
+},
+  "traffic": {
+  "business_table_writes_dir": "./migration_report/timeseries/business_table_writes",
+  "business_query_log_stats": {
+    # "writes_dir": "",
+    "reads_dir": "./migration_report/timeseries/query_log_reads",
+    "reads_by_user_group_csv": "./migration_report/timeseries/query_log_reads_by_user_group.csv"
+  },
+  # "query_log_written_bytes_timeseries_csv": "",
+  "query_log_failures_timeseries_csv": "./migration_report/timeseries/query_log_failures_timeseries.csv",
+  "query_log_failures_timeseries_by_user_group_csv": "./migration_report/timeseries/query_log_failures_timeseries_by_user_group.csv",
+  "query_log_latency_timeseries_by_user_group_csv": "./migration_report/timeseries/query_log_latency_timeseries_by_user_group.csv",
+  "slow_queries_csv": "./migration_report/timeseries/slow_queries_top.csv",
+  "slow_queries_by_user_group_csv": "./migration_report/timeseries/slow_queries_top_by_user_group.csv",
+  "query_time_range_distribution_by_user_group_csv": "./migration_report/timeseries/query_time_range_distribution_by_user_group.csv",
+  "query_time_range_distribution_strict_csv": "./migration_report/timeseries/query_time_range_distribution_strict.csv",
+  "query_time_range_distribution_strict_by_user_group_csv": "./migration_report/timeseries/query_time_range_distribution_strict_by_user_group.csv"
+},
+  "resources": {
+    "node_level": {
+  "hostname": "dmoc-fefcfea2f8d9",
+  "server_model": "acloud",
+  "os_arch": "x86_64",
+  "os_kernel": "4.19.90-25.17.230.po1.x86_64",
+  "cpu_cores": 32,
+  "memory_total_bytes": 269892194304,
+  "memory_used_bytes": 148638744576,
+  "disk_total_bytes": 114491191296,
+  "disk_used_bytes": 7394033664,
+  "memory_usage_percent": 55.07,
+  "disk_usage_percent": 6.46,
+  "load_avg_1min": 40.49,
+  "load_avg_5min": 33.62,
+  "load_avg_15min": 29.80,
+  "cpu_flags": "avx2",
+  "swap_total_bytes": 0,
+  "swap_used_bytes": 0,
+  "fd_allocated": 37728,
+  "fd_max": 9223372036854775807,
+  "tcp_in_use": 754,
+  "tcp_time_wait": 346,
+  "storage_volumes_csv": "./migration_report/snapshots/cluster_storage_volumes.csv",
+  "k8s_nodes_csv": "./migration_report/snapshots/cluster_k8s_nodes.csv",
+  "cluster_nodes_timeseries_prom": "./migration_report/timeseries/cluster_node_usage_timeseries.prom",
+  "cluster_filesystems_timeseries_prom": "./migration_report/timeseries/cluster_filesystem_usage_timeseries.prom"
+},
+    "ck_level": {
+  "pod_usage_timeseries_prom": "./migration_report/timeseries/ck_pod_usage_timeseries.prom",
+  "clickhouse_metrics_timeseries_prom": "./migration_report/timeseries/clickhouse_metrics_timeseries.prom"
+}
+  },
+  "meta": {
+  "collection_timestamp": "2026-01-26T10:20:13Z",
+  "helm_values_dir": "./migration_report/helm",
+  "system_settings_csv": "./migration_report/snapshots/system_settings.csv",
+  "system_build_options_csv": "./migration_report/snapshots/system_build_options.csv"
+}
+}

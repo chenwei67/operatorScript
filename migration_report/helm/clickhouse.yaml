@@ -1,0 +1,38 @@
+USER-SUPPLIED VALUES:
+annotations:
+  deployTime: "20260109070847"
+clusters:
+  replicasCount: 1
+  shardsCount: 4
+defaultProfile:
+  max_execution_time: 3600
+image:
+  registry: proxy.harbor
+  repository: local-xdr/clickhouse-server
+  tag: 23.2.5.110
+persistence:
+  size: 500Gi
+  storageClass: local-big-storage
+podAnnotations:
+  deployTime: "20260109070847"
+ports:
+  http: "8123"
+priorityClassName: service-node-high
+profiles:
+  max_execution_time: 3600
+  max_memory_usage: 15000000000
+resources:
+  limits:
+    cpu: 10
+    memory: 120Gi
+  requests:
+    cpu: 1
+    memory: 40Gi
+settings:
+  index_uncompressed_cache_size: 37580963840
+  remote_servers/xdr-ck/secret: 9e9db2df63a11676edda19e3b65c3abe491ccd29105ebcd7dedad5465dc82c08
+users:
+  name: root
+  password_sha256_hex: 9e9db2df63a11676edda19e3b65c3abe491ccd29105ebcd7dedad5465dc82c08
+zookeeper:
+  host: zookeeper-headless.ck

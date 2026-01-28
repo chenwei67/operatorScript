@@ -1,0 +1,189 @@
+USER-SUPPLIED VALUES:
+annotations:
+  deployTime: "20260109070838"
+clickhouse:
+  chiName: pro
+  clusterName: xdr-ck
+  httpPort: 8123
+  maxConcurrentQueries: 100
+  password: t5K0RKYBePja49CPQ9TJ
+  replicas: 1
+  resourceBudget:
+    enabled: true
+    io_burst: 1
+    overcommit:
+      historical_statistics:
+        enabled: true
+        interval: 10m
+        recall: 5m
+        timeout: 9m
+      ratio: 1.5
+    query_share:
+      cpu: 1
+      io: 50
+      memory: 1024
+    total:
+      cpu: 100000
+      io: 3000000
+      memory: 102400000
+  shards: 4
+  username: root
+image:
+  repository: proxy.harbor/local-xdr/business-ck-proxy-svc
+  tag: 25.3-xdr-local-30b7e2df
+podAnnotations:
+  deployTime: "20260109070838"
+priorityClassName: service-node-high
+replicaCount: 1
+resources:
+  limits:
+    cpu: 500m
+    memory: 1Gi
+  requests:
+    cpu: 50m
+    memory: 50Mi
+runEnv: local-xdr
+users:
+  <DEFAULT_USER>:
+    max_concurrent_queries: 1
+    max_execution_time: 10m
+    max_queue_size: 0
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 1024
+    requests_per_minute: 1200
+    to_cluster: pro
+  root:
+    max_concurrent_queries: 3
+  user_ck_exporter_readonly:
+    max_concurrent_queries: 1
+    max_execution_time: 600s
+    max_queue_size: 5
+    max_queue_time: 30s
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 1024
+    requests_per_minute: 60
+  user_dsp_log_search_readonly:
+    max_concurrent_queries: 15
+    max_execution_time: 600s
+    max_queue_size: 0
+    query_shares_in_resource_budget:
+      cpu: 5
+      io: 150
+      memory: 15360
+    requests_per_minute: 2000
+  user_gpt_alert_readonly:
+    max_concurrent_queries: 1
+    max_execution_time: 600s
+    max_queue_size: 10
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 2048
+    requests_per_minute: 600
+  user_xdr_alpha_readonly:
+    max_concurrent_queries: 1
+    max_execution_time: 600s
+    max_queue_size: 10
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 1024
+    requests_per_minute: 600
+  user_xdr_analysis_screen_readonly:
+    max_concurrent_queries: 20
+    max_execution_time: 300s
+    max_queue_size: 20
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 3
+      io: 100
+      memory: 3072
+    requests_per_minute: 1000
+  user_xdr_analysis_weixin_readonly:
+    max_concurrent_queries: 10
+    max_execution_time: 300s
+    max_queue_size: 10
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 1024
+    requests_per_minute: 1000
+  user_xdr_asset_readwrite:
+    max_concurrent_queries: 1
+    max_execution_time: 600s
+    max_queue_size: 10
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 3072
+    requests_per_minute: 600
+  user_xdr_ced_readonly:
+    max_concurrent_queries: 1
+    max_execution_time: 600s
+    max_queue_size: 10
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 1024
+    requests_per_minute: 600
+  user_xdr_gpt_readonly:
+    max_concurrent_queries: 2
+    max_execution_time: 600s
+    max_queue_size: 30
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 1024
+    requests_per_minute: 600
+  user_xdr_incident_cron_readonly:
+    max_concurrent_queries: 5
+    max_execution_time: 300s
+    max_queue_size: 10
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 1024
+    requests_per_minute: 1000
+  user_xdr_incident_readonly:
+    max_concurrent_queries: 10
+    max_execution_time: 600s
+    max_queue_size: 30
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 5
+      io: 150
+      memory: 15360
+    requests_per_minute: 6000
+  user_xdr_log_search_readonly:
+    max_concurrent_queries: 30
+    max_execution_time: 600s
+    max_queue_size: 0
+    query_shares_in_resource_budget:
+      cpu: 5
+      io: 150
+      memory: 15360
+    requests_per_minute: 2000
+  user_xdr_ndr_readonly:
+    max_concurrent_queries: 1
+    max_execution_time: 600s
+    max_queue_size: 10
+    max_queue_time: 70s
+    query_shares_in_resource_budget:
+      cpu: 1
+      io: 50
+      memory: 1024
+    requests_per_minute: 600
+volumes:
+- mountPath: /var/lib/chproxy/cache
+  volumeType: emptyDir

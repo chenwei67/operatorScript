@@ -2586,8 +2586,10 @@ CK_POD_MEM_BASE=$(printf 'sum by (pod) (container_memory_working_set_bytes{names
 CK_POD_MEM_USAGE_BASE=$(printf 'sum by (pod) (container_memory_usage_bytes{namespace="%s", container!="POD", container!=""})' "$CK_K8S_NAMESPACE")
 CK_POD_NET_RX_BASE=$(printf 'sum by (pod) (rate(container_network_receive_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
 CK_POD_NET_TX_BASE=$(printf 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
-CK_POD_DISK_R_BASE=$(printf 'sum by (pod) (rate(container_fs_reads_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
-CK_POD_DISK_W_BASE=$(printf 'sum by (pod) (rate(container_fs_writes_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
+CK_POD_DISK_R_BASE=$(printf 'sum by (pod, device) (rate(container_fs_reads_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
+CK_POD_DISK_W_BASE=$(printf 'sum by (pod, device) (rate(container_fs_writes_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
+CK_POD_DISK_READ_IOPS_BASE=$(printf 'sum by (pod, device) (rate(container_fs_reads_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
+CK_POD_DISK_WRITE_IOPS_BASE=$(printf 'sum by (pod, device) (rate(container_fs_writes_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
 CK_POD_THROTTLE_BASE=$(printf 'sum by (pod) (rate(container_cpu_cfs_throttled_seconds_total{namespace="%s", container!="POD", container!=""}[%s])) * 100' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
 CK_POD_CPU_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="%s", container!="POD", container!=""}[%s])) * 100' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_CPU_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_CPU_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
@@ -2599,10 +2601,14 @@ CK_POD_NET_RX_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_network_receive_
 CK_POD_NET_RX_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_NET_RX_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
 CK_POD_NET_TX_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_NET_TX_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_NET_TX_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
-CK_POD_DISK_R_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_fs_reads_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
+CK_POD_DISK_R_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_reads_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_DISK_R_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_R_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
-CK_POD_DISK_W_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_fs_writes_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
+CK_POD_DISK_W_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_writes_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_DISK_W_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_W_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_POD_DISK_READ_IOPS_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_reads_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
+CK_POD_DISK_READ_IOPS_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_READ_IOPS_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+CK_POD_DISK_WRITE_IOPS_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_writes_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
+CK_POD_DISK_WRITE_IOPS_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_WRITE_IOPS_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
 CK_POD_THROTTLE_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_cpu_cfs_throttled_seconds_total{namespace="%s", container!="POD", container!=""}[%s])) * 100' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_THROTTLE_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_THROTTLE_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
 POD_RANGE_START_TS=$((OLDEST_BUCKET_START + VM_STEP_SECONDS))
@@ -2625,10 +2631,14 @@ vm_fetch_range_prometheus "$CK_POD_NET_RX_AVG_PROMQL" "$POD_RANGE_START_TS" "$PO
 vm_fetch_range_prometheus "$CK_POD_NET_RX_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_net_rx_mbps_max" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_NET_TX_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_net_tx_mbps_avg" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_NET_TX_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_net_tx_mbps_max" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_R_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_disk_read_mbps_avg" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_R_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_disk_read_mbps_max" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_W_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_disk_write_mbps_avg" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_W_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_disk_write_mbps_max" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_DISK_R_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_mbps_avg" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_DISK_R_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_mbps_max" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_DISK_W_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_mbps_avg" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_DISK_W_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_mbps_max" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_DISK_READ_IOPS_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_iops_avg" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_DISK_READ_IOPS_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_iops_max" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_DISK_WRITE_IOPS_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_iops_avg" "false" "$STATIC_POD_LABELS"
+vm_fetch_range_prometheus "$CK_POD_DISK_WRITE_IOPS_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_iops_max" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_THROTTLE_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_cpu_throttle_percent_avg" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_THROTTLE_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_cpu_throttle_percent_max" "false" "$STATIC_POD_LABELS"
 CK_POD_METRICS_END_TS=$(date +%s)
@@ -2737,13 +2747,15 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   CLUSTER_LOAD5_BASE=$(printf "node_load5%s" "$CLUSTER_LOAD_SELECTOR")
   CLUSTER_LOAD15_BASE=$(printf "node_load15%s" "$CLUSTER_LOAD_SELECTOR")
   CLUSTER_SWAP_BASE=$(printf "(1 - (node_memory_SwapFree_bytes%s / clamp_min(node_memory_SwapTotal_bytes%s,1))) * 100" "$CLUSTER_MEM_SELECTOR" "$CLUSTER_MEM_SELECTOR")
-  CLUSTER_DISK_READ_BASE=$(printf "(sum by (instance) (rate(node_disk_read_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
-  CLUSTER_DISK_WRITE_BASE=$(printf "(sum by (instance) (rate(node_disk_written_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
-  CLUSTER_DISK_AWAIT_BASE=$(printf "(1000 * (sum by (instance) (rate(node_disk_read_time_seconds_total%s[%s])) + sum by (instance) (rate(node_disk_write_time_seconds_total%s[%s]))) / clamp_min((sum by (instance) (rate(node_disk_reads_completed_total%s[%s])) + sum by (instance) (rate(node_disk_writes_completed_total%s[%s]))), 0.001))" \
+  CLUSTER_DISK_READ_BASE=$(printf "(sum by (instance, device) (rate(node_disk_read_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_WRITE_BASE=$(printf "(sum by (instance, device) (rate(node_disk_written_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_AWAIT_BASE=$(printf "(1000 * (sum by (instance, device) (rate(node_disk_read_time_seconds_total%s[%s])) + sum by (instance, device) (rate(node_disk_write_time_seconds_total%s[%s]))) / clamp_min((sum by (instance, device) (rate(node_disk_reads_completed_total%s[%s])) + sum by (instance, device) (rate(node_disk_writes_completed_total%s[%s]))), 0.001))" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_READ_IOPS_BASE=$(printf "sum by (instance, device) (rate(node_disk_reads_completed_total%s[%s]))" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_WRITE_IOPS_BASE=$(printf "sum by (instance, device) (rate(node_disk_writes_completed_total%s[%s]))" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_NET_RX_BASE=$(printf "(sum by (instance) (rate(node_network_receive_bytes_total%s[%s])) / 1000000)" "$CLUSTER_NET_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_NET_TX_BASE=$(printf "(sum by (instance) (rate(node_network_transmit_bytes_total%s[%s])) / 1000000)" "$CLUSTER_NET_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_CPU_AVG_PROMQL=$(printf "sum by (instance) (rate(node_cpu_seconds_total%s[%s])) * 100" "$CLUSTER_CPU_SELECTOR" "$VM_BUCKET_WINDOW")
@@ -2760,16 +2772,20 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   CLUSTER_LOAD15_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_LOAD15_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
   CLUSTER_SWAP_AVG_PROMQL=$(over_time_promql "avg_over_time" "$CLUSTER_SWAP_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
   CLUSTER_SWAP_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_SWAP_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
-  CLUSTER_DISK_READ_AVG_PROMQL=$(printf "(sum by (instance) (rate(node_disk_read_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
+  CLUSTER_DISK_READ_AVG_PROMQL=$(printf "(sum by (instance, device) (rate(node_disk_read_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_DISK_READ_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_READ_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
-  CLUSTER_DISK_WRITE_AVG_PROMQL=$(printf "(sum by (instance) (rate(node_disk_written_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
+  CLUSTER_DISK_WRITE_AVG_PROMQL=$(printf "(sum by (instance, device) (rate(node_disk_written_bytes_total%s[%s])) / 1000000)" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_DISK_WRITE_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_WRITE_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
-  CLUSTER_DISK_AWAIT_AVG_PROMQL=$(printf "(1000 * (sum by (instance) (rate(node_disk_read_time_seconds_total%s[%s])) + sum by (instance) (rate(node_disk_write_time_seconds_total%s[%s]))) / clamp_min((sum by (instance) (rate(node_disk_reads_completed_total%s[%s])) + sum by (instance) (rate(node_disk_writes_completed_total%s[%s]))), 0.001))" \
+  CLUSTER_DISK_AWAIT_AVG_PROMQL=$(printf "(1000 * (sum by (instance, device) (rate(node_disk_read_time_seconds_total%s[%s])) + sum by (instance, device) (rate(node_disk_write_time_seconds_total%s[%s]))) / clamp_min((sum by (instance, device) (rate(node_disk_reads_completed_total%s[%s])) + sum by (instance, device) (rate(node_disk_writes_completed_total%s[%s]))), 0.001))" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_DISK_AWAIT_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_AWAIT_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_READ_IOPS_AVG_PROMQL=$(printf "sum by (instance, device) (rate(node_disk_reads_completed_total%s[%s]))" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
+  CLUSTER_DISK_READ_IOPS_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_READ_IOPS_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_WRITE_IOPS_AVG_PROMQL=$(printf "sum by (instance, device) (rate(node_disk_writes_completed_total%s[%s]))" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
+  CLUSTER_DISK_WRITE_IOPS_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_WRITE_IOPS_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
   CLUSTER_NET_RX_AVG_PROMQL=$(printf "(sum by (instance) (rate(node_network_receive_bytes_total%s[%s])) / 1000000)" "$CLUSTER_NET_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_NET_RX_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_NET_RX_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
   CLUSTER_NET_TX_AVG_PROMQL=$(printf "(sum by (instance) (rate(node_network_transmit_bytes_total%s[%s])) / 1000000)" "$CLUSTER_NET_SELECTOR" "$VM_BUCKET_WINDOW")
@@ -2797,12 +2813,16 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   vm_fetch_range_prometheus "$CLUSTER_LOAD15_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_load15_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_SWAP_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_swap_usage_percent_avg" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_SWAP_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_swap_usage_percent_max" "true" "$STATIC_NODE_LABELS"
-  vm_fetch_range_prometheus "$CLUSTER_DISK_READ_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_read_mbps_avg" "true" "$STATIC_NODE_LABELS"
-  vm_fetch_range_prometheus "$CLUSTER_DISK_READ_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_read_mbps_max" "true" "$STATIC_NODE_LABELS"
-  vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_write_mbps_avg" "true" "$STATIC_NODE_LABELS"
-  vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_write_mbps_max" "true" "$STATIC_NODE_LABELS"
-  vm_fetch_range_prometheus "$CLUSTER_DISK_AWAIT_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_await_ms_avg" "true" "$STATIC_NODE_LABELS"
-  vm_fetch_range_prometheus "$CLUSTER_DISK_AWAIT_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_disk_await_ms_max" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_READ_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_read_mbps_avg" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_READ_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_read_mbps_max" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_write_mbps_avg" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_write_mbps_max" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_AWAIT_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_await_ms_avg" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_AWAIT_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_await_ms_max" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_READ_IOPS_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_read_iops_avg" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_READ_IOPS_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_read_iops_max" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_IOPS_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_write_iops_avg" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_IOPS_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_write_iops_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_NET_RX_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_net_rx_mbps_avg" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_NET_RX_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_net_rx_mbps_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_NET_TX_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance" "sr_migration_cluster_node_net_tx_mbps_avg" "true" "$STATIC_NODE_LABELS"

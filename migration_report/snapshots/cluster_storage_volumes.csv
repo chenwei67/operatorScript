@@ -1,0 +1,5 @@
+"node_host","name","path","total_space_bytes","free_space_bytes","keep_free_space_bytes"
+"chi-pro-xdr-ck-0-0-0","default","/var/lib/clickhouse/",10907262287872,4589050871808,0
+"chi-pro-xdr-ck-1-0-0","default","/var/lib/clickhouse/",10907262287872,4544148971520,0
+"chi-pro-xdr-ck-2-0-0","default","/var/lib/clickhouse/",10907262287872,4505538011136,0
+"chi-pro-xdr-ck-3-0-0","default","/var/lib/clickhouse/",10907262287872,4559576338432,0

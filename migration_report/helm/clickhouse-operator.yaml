@@ -1,0 +1,28 @@
+USER-SUPPLIED VALUES:
+annotations:
+  deployTime: "20260109070844"
+global:
+  registry: proxy.harbor
+images:
+  clickhouse:
+    repository: local-xdr/clickhouse-server
+    tag: 23.2.5.110
+  clickhouse_operator:
+    repository: local-xdr/clickhouse-operator
+    tag: 0.18.15-609768a0
+  metrics_exporter:
+    repository: local-xdr/metrics-exporter
+    tag: 0.18.5
+podAnnotations:
+  deployTime: "20260109070844"
+podManagementPolicyType: Parallel
+priorityClassName: service-cluster-high
+resources:
+  limits:
+    cpu: 100m
+    memory: 500Mi
+  requests:
+    cpu: 50m
+    memory: 50Mi
+users:
+  password_sha256_hex: Y2xpY2tob3VzZV9vcGVyYXRvcl9wYXNzd29yZA==
