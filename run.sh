@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-days=(1 3 7 15 30 60)
-for d in "${days[@]}"; do
-  ./collect.sh \
-    --business-time-config ./business_time_config.yaml \
-    --resource-history-days "$d" \
-    --query-time-range-days "$d" \
-    --vm-service "vmselect-vmcluster" \
-    --vm-namespace "monitor-platform" \
-    --output-dir "./migration_report_${d}"
-done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTPUT_DIR="${SCRIPT_DIR}/migration_report"
+ARCHIVE_NAME="${OUTPUT_DIR}.tar.gz"
+
+"${SCRIPT_DIR}/collect.sh"
+
+if [[ -f "$ARCHIVE_NAME" ]]; then
+  tar -xzf "$ARCHIVE_NAME" -C "$(dirname "$OUTPUT_DIR")"
+fi
+
+"${SCRIPT_DIR}/generate_report.py" "$OUTPUT_DIR"
