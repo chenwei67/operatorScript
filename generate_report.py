@@ -22,6 +22,45 @@ def to_gb(value):
     except Exception:
         return "0.00"
 
+def format_plain_number(value):
+    try:
+        val = float(value)
+    except Exception:
+        return ""
+    text = "{:.2f}".format(val)
+    text = text.rstrip("0").rstrip(".")
+    return text
+
+def parse_cpu_to_cores(value):
+    try:
+        val = str(value).strip()
+        if not val:
+            return ""
+        if val.endswith("m"):
+            return format_plain_number(float(val[:-1]) / 1000.0)
+        return format_plain_number(float(val))
+    except Exception:
+        return ""
+
+def to_gb_from_mem(value):
+    try:
+        val = str(value).strip()
+        if not val:
+            return ""
+        if val.endswith("Ki"):
+            val = float(val[:-2]) / (1024 ** 2)
+        elif val.endswith("Mi"):
+            val = float(val[:-2]) / 1024.0
+        elif val.endswith("Gi"):
+            val = float(val[:-2])
+        elif val.endswith("Ti"):
+            val = float(val[:-2]) * 1024.0
+        else:
+            val = float(val) / (1024 ** 3)
+        return "{:.2f}".format(val)
+    except Exception:
+        return ""
+
 def to_gb_from_kib(value):
     try:
         val = str(value).strip()
@@ -38,6 +77,16 @@ avx2_supported = "支持AVX2" if "avx2" in cpu_flags else "不支持AVX2"
 cpu_value = "{}（{}）".format(cpu_flags, avx2_supported) if cpu_flags else avx2_supported
 
 k8s_nodes = read_csv(input_dir / "snapshots/cluster_k8s_nodes.csv")
+device_mapper_rows = []
+device_mapper_path = input_dir / "snapshots/device_mapper.csv"
+if device_mapper_path.exists():
+    device_mapper_rows = read_csv(device_mapper_path)
+device_mapper = {}
+for r in device_mapper_rows:
+    mapper_name = (r.get("mapper_name") or "").strip()
+    device_name = (r.get("device") or "").strip()
+    if mapper_name and device_name:
+        device_mapper[mapper_name] = device_name
 node_rows = [
     [
         get_value(r, "name"),
@@ -48,14 +97,10 @@ node_rows = [
         to_gb_from_kib(get_value(r, "memory_capacity")),
         get_value(r, "cpu_allocatable"),
         to_gb_from_kib(get_value(r, "memory_allocatable")),
-        get_value(r, "cpu_requests"),
-        get_value(r, "cpu_requests_percent"),
-        get_value(r, "cpu_limits"),
-        get_value(r, "cpu_limits_percent"),
-        get_value(r, "memory_requests"),
-        get_value(r, "memory_requests_percent"),
-        get_value(r, "memory_limits"),
-        get_value(r, "memory_limits_percent"),
+        parse_cpu_to_cores(get_value(r, "cpu_requests")),
+        parse_cpu_to_cores(get_value(r, "cpu_limits")),
+        to_gb_from_mem(get_value(r, "memory_requests")),
+        to_gb_from_mem(get_value(r, "memory_limits")),
         get_value(r, "creation_timestamp"),
     ]
     for r in k8s_nodes
@@ -124,16 +169,17 @@ non_business = [[r["database"], r["table"]] for r in table_stats if r["database"
 views = read_csv(input_dir / "views_ddl.csv")
 views_rows = [[r["database"], r["view"], r["engine"], r["create_table_query_one_line"]] for r in views]
 
-plot_mode = "svg"
+plot_mode = "matplotlib"
 plt = None
 try:
     import matplotlib
     import matplotlib.pyplot as plt
     matplotlib.rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "STHeiti", "Arial Unicode MS", "SimHei"]
     matplotlib.rcParams["axes.unicode_minus"] = False
-    plot_mode = "matplotlib"
-except Exception:
-    plot_mode = "svg"
+except Exception as e:
+    sys.stderr.write("ERROR: 绘图依赖未就绪，请安装 matplotlib。\n")
+    sys.stderr.write("ERROR: {}\n".format(e))
+    sys.exit(1)
 
 def parse_prom_line(line):
     line = line.strip()
@@ -203,12 +249,13 @@ def series_latest(points):
 
 def get_series_points(metrics, metric_name, instance, device=None):
     series_map = metrics.get(metric_name, {})
-    keys = []
-    if device:
-        keys.append("instance={} device={}".format(instance, device))
     if instance:
-        keys.append("instance={}".format(instance))
-    for key in keys:
+        if device:
+            key = "instance={} device={}".format(instance, device)
+            if key in series_map:
+                return series_map[key]
+            return []
+        key = "instance={}".format(instance)
         if key in series_map:
             return series_map[key]
     return []
@@ -236,82 +283,6 @@ def category_for_file(fname):
         return "业务表写入"
     return "其它时序"
 
-def render_svg(series_list, out_path, title, y_label, x_tick_mode=None, x_tick_rotation=-30):
-    width = 900
-    height = 460
-    padding_left = 80
-    padding_right = 180
-    padding_top = 40
-    padding_bottom = 90
-    plot_width = width - padding_left - padding_right
-    plot_height = height - padding_top - padding_bottom
-    all_x = []
-    all_y = []
-    for _, points in series_list:
-        for x, y in points:
-            all_x.append(x)
-            all_y.append(y)
-    if not all_x or not all_y:
-        return
-    min_x, max_x = min(all_x), max(all_x)
-    min_y, max_y = min(all_y), max(all_y)
-    if max_y == min_y:
-        max_y = min_y + 1.0
-    if max_x == min_x:
-        max_x = min_x + 1.0
-    colors = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-    ]
-    lines = []
-    lines.append('<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}">'.format(width, height))
-    lines.append('<rect width="100%" height="100%" fill="white"/>')
-    lines.append('<text x="{}" y="{}" font-size="16" font-family="Arial">{}</text>'.format(padding_left, 24, title))
-    lines.append('<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#666666"/>'.format(padding_left, height - padding_bottom, width - padding_right, height - padding_bottom))
-    lines.append('<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#666666"/>'.format(padding_left, padding_top, padding_left, height - padding_bottom))
-    x_tick_count = 6
-    for i in range(x_tick_count + 1):
-        frac = float(i) / float(x_tick_count)
-        dt_tick = min_x + (max_x - min_x) * frac
-        px = padding_left + frac * plot_width
-        lines.append('<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#666666"/>'.format(px, height - padding_bottom, px, height - padding_bottom + 8))
-        lines.append('<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#eeeeee"/>'.format(px, padding_top, px, height - padding_bottom))
-        if x_tick_mode == "hour":
-            dt_tick = dt_tick.replace(minute=0, second=0, microsecond=0)
-            label = dt_tick.strftime("%m-%d %H:00")
-        else:
-            label = dt_tick.strftime("%m-%d %H:%M")
-        lines.append('<text x="{}" y="{}" font-size="7" font-family="Arial" text-anchor="middle" transform="rotate({} {} {})">{}</text>'.format(px, height - padding_bottom + 28, x_tick_rotation, px, height - padding_bottom + 28, label))
-    y_tick_count = 5
-    for i in range(y_tick_count + 1):
-        frac = float(i) / float(y_tick_count)
-        val = min_y + (max_y - min_y) * frac
-        py = height - padding_bottom - frac * plot_height
-        lines.append('<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#666666"/>'.format(padding_left - 8, py, padding_left, py))
-        lines.append('<line x1="{}" y1="{}" x2="{}" y2="{}" stroke="#eeeeee"/>'.format(padding_left, py, width - padding_right, py))
-        label = "{:.2f}".format(val)
-        lines.append('<text x="{}" y="{}" font-size="12" font-family="Arial" text-anchor="end">{}</text>'.format(padding_left - 12, py + 4, label))
-    lines.append('<text x="{}" y="{}" font-size="12" font-family="Arial" text-anchor="middle">时间</text>'.format(padding_left + plot_width / 2.0, height - 18))
-    lines.append('<text x="{}" y="{}" font-size="12" font-family="Arial" text-anchor="middle" transform="rotate(-90 {} {})">{}</text>'.format(18, padding_top + plot_height / 2.0, 18, padding_top + plot_height / 2.0, y_label))
-    for idx, (label, points) in enumerate(series_list):
-        color = colors[idx % len(colors)]
-        coords = []
-        for x, y in points:
-            x_norm = (x - min_x) / (max_x - min_x)
-            y_norm = (y - min_y) / (max_y - min_y)
-            px = padding_left + x_norm * plot_width
-            py = height - padding_bottom - y_norm * plot_height
-            coords.append("{},{}".format(px, py))
-        lines.append('<polyline fill="none" stroke="{}" stroke-width="2" points="{}"/>'.format(color, " ".join(coords)))
-    legend_x = width - padding_right + 10
-    legend_y = padding_top + 10
-    for idx, (label, _) in enumerate(series_list):
-        color = colors[idx % len(colors)]
-        y = legend_y + idx * 18
-        lines.append('<rect x="{}" y="{}" width="10" height="10" fill="{}"/>'.format(legend_x, y - 8, color))
-        lines.append('<text x="{}" y="{}" font-size="11" font-family="Arial">{}</text>'.format(legend_x + 14, y, label))
-    lines.append("</svg>")
-    out_path.write_text("\n".join(lines), encoding="utf-8")
 
 def metric_desc(mname, y_label):
     desc_map = {
@@ -442,6 +413,22 @@ def pick_filesystem_device(total_series, instance):
             selected_device = dev
     return selected_device, max_total
 
+def normalize_device_name(device):
+    if not device:
+        return device
+    dev = str(device)
+    if dev.startswith("/dev/"):
+        dev = dev[len("/dev/"):]
+    if dev.startswith("mapper/"):
+        dev = dev[len("mapper/"):]
+    return dev
+
+def map_device(device):
+    base = normalize_device_name(device)
+    if not base:
+        return device
+    return device_mapper.get(base, base)
+
 cpu_summary_rows = []
 memory_summary_rows = []
 storage_summary_rows = []
@@ -451,38 +438,75 @@ for r in k8s_nodes:
     cpu_summary_rows.append([
         node_ip,
         get_value(r, "cpu_allocatable"),
-        get_value(r, "cpu_requests"),
-        get_value(r, "cpu_limits"),
+        parse_cpu_to_cores(get_value(r, "cpu_requests")),
+        parse_cpu_to_cores(get_value(r, "cpu_limits")),
         series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_cpu_usage_percent_avg", node_ip)),
         series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_cpu_usage_percent_max", node_ip)),
     ])
     memory_summary_rows.append([
         node_ip,
         to_gb_from_kib(get_value(r, "memory_allocatable")),
-        get_value(r, "memory_requests"),
-        get_value(r, "memory_limits"),
+        to_gb_from_mem(get_value(r, "memory_requests")),
+        to_gb_from_mem(get_value(r, "memory_limits")),
         series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_memory_usage_percent_avg", node_ip)),
         series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_memory_usage_percent_max", node_ip)),
     ])
     device, total_latest = pick_filesystem_device(filesystem_total_series, node_ip)
+    # todo 增加device的debug日志
+    sys.stderr.write("device issssss {}".format(device))
     free_points = get_series_points(filesystem_metrics, "sr_migration_cluster_filesystem_free_bytes", node_ip, device)
     free_latest = series_latest(free_points)
     free_percent = ""
     if free_latest is not None and total_latest not in (None, 0):
         free_percent = format_number((free_latest / total_latest) * 100.0)
+    mapped_device = map_device(device)
+    disk_await_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_await_ms_max", node_ip, mapped_device)
+    disk_await_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_await_ms_avg", node_ip, mapped_device)
+    disk_read_mbps_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_mbps_avg", node_ip, mapped_device)
+    disk_read_mbps_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_mbps_max", node_ip, mapped_device)
+    disk_read_iops_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_iops_avg", node_ip, mapped_device)
+    disk_read_iops_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_iops_max", node_ip, mapped_device)
+    disk_write_iops_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_iops_avg", node_ip, mapped_device)
+    disk_write_iops_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_iops_max", node_ip, mapped_device)
+    disk_values = [
+        series_max(disk_await_max_points),
+        series_avg(disk_await_avg_points),
+        series_avg(disk_read_mbps_avg_points),
+        series_max(disk_read_mbps_max_points),
+        series_avg(disk_read_iops_avg_points),
+        series_max(disk_read_iops_max_points),
+        series_avg(disk_write_iops_avg_points),
+        series_max(disk_write_iops_max_points),
+    ]
+    if all(v == "" for v in disk_values):
+        keys = sorted(node_usage_metrics.keys())
+        sys.stderr.write("DEBUG: storage metrics empty for node_ip={} device={} metrics_count={}\n".format(node_ip, device or "", len(keys)))
+        for metric_name in (
+            "sr_migration_cluster_node_disk_await_ms_avg",
+            "sr_migration_cluster_node_disk_await_ms_max",
+            "sr_migration_cluster_node_disk_read_mbps_avg",
+            "sr_migration_cluster_node_disk_read_mbps_max",
+            "sr_migration_cluster_node_disk_read_iops_avg",
+            "sr_migration_cluster_node_disk_read_iops_max",
+            "sr_migration_cluster_node_disk_write_iops_avg",
+            "sr_migration_cluster_node_disk_write_iops_max",
+        ):
+            series_map = node_usage_metrics.get(metric_name, {})
+            matched_keys = [k for k in series_map.keys() if node_ip in k]
+            sys.stderr.write("DEBUG: metric={} matched_keys={}\n".format(metric_name, ",".join(matched_keys)))
     storage_summary_rows.append([
         node_ip,
         to_gb(total_latest) if total_latest is not None else "",
         to_gb(free_latest) if free_latest is not None else "",
         free_percent,
-        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_await_ms_max", node_ip, device)),
-        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_await_ms_avg", node_ip, device)),
-        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_mbps_avg", node_ip, device)),
-        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_mbps_max", node_ip, device)),
-        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_iops_avg", node_ip, device)),
-        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_iops_max", node_ip, device)),
-        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_iops_avg", node_ip, device)),
-        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_iops_max", node_ip, device)),
+        disk_values[0],
+        disk_values[1],
+        disk_values[2],
+        disk_values[3],
+        disk_values[4],
+        disk_values[5],
+        disk_values[6],
+        disk_values[7],
     ])
     net_summary_rows.append([
         node_ip,
@@ -539,61 +563,65 @@ for pf in prom_files:
         def last_value(points):
             return points[-1][1] if points else float("-inf")
         sorted_series = sorted(series_map.items(), key=lambda kv: last_value(kv[1]), reverse=True)[:10]
-        if plot_mode == "matplotlib":
-            plt.figure(figsize=(10, 5))
-            try:
-                import matplotlib.dates as mdates
-                ax = plt.gca()
-                if is_business_writes:
-                    locator = mdates.HourLocator(interval=1)
-                    formatter = mdates.DateFormatter("%m-%d %H:00")
-                else:
-                    locator = mdates.AutoDateLocator()
-                    formatter = mdates.ConciseDateFormatter(locator)
-                ax.xaxis.set_major_locator(locator)
-                ax.xaxis.set_major_formatter(formatter)
-                ax.tick_params(axis="x", labelsize=8)
-                if is_business_writes:
-                    plt.setp(ax.get_xticklabels(), rotation=90, ha="center", va="center")
-            except Exception:
-                pass
-            for sk, points in sorted_series:
-                xs = [p[0] for p in points]
-                ys = [p[1] for p in points]
-                if xs and ys:
-                    plt.plot(xs, ys, label=sk)
-            plt.title("{} ({})".format(mname, pf.name))
-            plt.xlabel("时间")
-            plt.ylabel(y_label)
-            plt.legend(loc="best", fontsize=8)
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            out_path = cat_dir / ("{}.png".format(mname))
-            try:
-                plt.savefig(str(out_path))
-            except Exception:
-                pass
-            finally:
-                plt.close()
-        else:
-            out_path = cat_dir / ("{}.svg".format(mname))
-            render_svg(sorted_series, out_path, "{} ({})".format(mname, pf.name), y_label, x_tick_mode="hour" if is_business_writes else None, x_tick_rotation=90 if is_business_writes else -30)
+        plt.figure(figsize=(10, 5))
+        try:
+            import matplotlib.dates as mdates
+            ax = plt.gca()
+            if is_business_writes:
+                locator = mdates.HourLocator(interval=1)
+                formatter = mdates.DateFormatter("%m-%d %H:00")
+            else:
+                locator = mdates.AutoDateLocator()
+                formatter = mdates.ConciseDateFormatter(locator)
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(formatter)
+            ax.tick_params(axis="x", labelsize=8)
+            if is_business_writes:
+                plt.setp(ax.get_xticklabels(), rotation=90, ha="center", va="center")
+        except Exception:
+            pass
+        for sk, points in sorted_series:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            if xs and ys:
+                plt.plot(xs, ys, label=sk)
+        plt.title("{} ({})".format(mname, pf.name))
+        plt.xlabel("时间")
+        plt.ylabel(y_label)
+        plt.legend(loc="best", fontsize=8)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        out_path = cat_dir / ("{}.png".format(mname))
+        try:
+            plt.savefig(str(out_path))
+        except Exception:
+            pass
+        finally:
+            plt.close()
         section["images"].append({"path": out_path, "desc": metric_desc(mname, y_label)})
     timeseries_sections.append(section)
 
 pdf_path = input_dir / "report.pdf"
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.platypus.tableofcontents import TableOfContents
+from reportlab.platypus import PageBreak
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from PIL import Image as PILImage
+
+svg2rlg = None
+renderPM = None
 try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
-    from reportlab.platypus.tableofcontents import TableOfContents
-    from reportlab.platypus import PageBreak
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-    from PIL import Image as PILImage
+    from svglib.svglib import svg2rlg
+    from reportlab.graphics import renderPM
 except Exception:
-    sys.exit(0)
+    svg2rlg = None
+    renderPM = None
+
 
 styles = getSampleStyleSheet()
 pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
@@ -607,6 +635,30 @@ style_body.fontName = "STSong-Light"
 style_table.fontName = "STSong-Light"
 style_table.fontSize = 8
 style_table.leading = 10
+def truncate_text(text, max_width, font_name, font_size):
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        s = str(text)
+        w = pdfmetrics.stringWidth(s, font_name, font_size)
+        if w <= max_width:
+            return s
+        ell = "…"
+        ell_w = pdfmetrics.stringWidth(ell, font_name, font_size)
+        target = max(0.0, max_width - ell_w)
+        lo, hi = 0, len(s)
+        best = ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            t = s[:mid]
+            tw = pdfmetrics.stringWidth(t, font_name, font_size)
+            if tw <= target:
+                best = t
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best + ell
+    except Exception:
+        return str(text)
 
 class PdfDoc(SimpleDocTemplate):
     def afterFlowable(self, flowable):
@@ -644,24 +696,65 @@ def add_table(table_rows):
     weights = [max(6, min(60, v)) for v in col_max]
     total_w = float(sum(weights))
     col_widths = [max_width * (w / total_w) for w in weights]
+    font_name = style_table.fontName
+    base_font_size = style_table.fontSize
+    min_font_size = 5.0
+    target_font_size = base_font_size
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        for row in table_rows:
+            for i, cell in enumerate(row):
+                text = str(cell)
+                if not text:
+                    continue
+                avail = max(1.0, col_widths[i] - 4)
+                text_width = pdfmetrics.stringWidth(text, font_name, base_font_size)
+                if text_width > 0:
+                    candidate = base_font_size * (avail / text_width)
+                    if candidate < target_font_size:
+                        target_font_size = candidate
+        if target_font_size < min_font_size:
+            target_font_size = min_font_size
+        if target_font_size > base_font_size:
+            target_font_size = base_font_size
+    except Exception:
+        target_font_size = base_font_size
     table_cells = []
     for r_idx, row in enumerate(table_rows):
         row_cells = []
-        for cell in row:
-            row_cells.append(Paragraph(str(cell), style_table))
+        for i, cell in enumerate(row):
+            row_cells.append(str(cell))
         table_cells.append(row_cells)
     table = Table(table_cells, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("FONTNAME", (0, 0), (-1, 0), "STSong-Light"),
+        ("FONTNAME", (0, 0), (-1, -1), "STSong-Light"),
+        ("FONTSIZE", (0, 0), (-1, -1), target_font_size),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
     ]))
     flow.append(table)
     flow.append(Spacer(1, 10))
 
 def add_image(image_path):
     try:
+        if image_path.suffix.lower() == ".svg":
+            if svg2rlg and renderPM:
+                drawing = svg2rlg(str(image_path))
+                if drawing:
+                    png_path = image_path.with_suffix(".png")
+                    renderPM.drawToFile(drawing, str(png_path), fmt="PNG")
+                    image_path = png_path
+                else:
+                    sys.stderr.write("ERROR: SVG图片无法渲染，请安装svglib或matplotlib生成PNG。\n")
+                    add_paragraph("图片加载失败：{}".format(image_path))
+                    return
+            else:
+                sys.stderr.write("ERROR: SVG图片无法渲染，请安装svglib或matplotlib生成PNG。\n")
+                add_paragraph("图片加载失败：{}".format(image_path))
+                return
         with PILImage.open(image_path) as im:
             width, height = im.size
         max_width = A4[0] - 72
@@ -685,7 +778,7 @@ add_table([["项目", "值"], ["CPU指令集", cpu_value]])
 
 add_heading("K8S节点信息")
 add_table([
-    ["name", "internal_ip", "os_image", "kernel_version", "cpu_capacity", "memory_capacity_GB", "cpu_allocatable", "memory_allocatable_GB", "cpu_requests", "cpu_requests_percent", "cpu_limits", "cpu_limits_percent", "memory_requests", "memory_requests_percent", "memory_limits", "memory_limits_percent", "creation_timestamp"]
+    ["name", "internal_ip", "os_image", "kernel_version", "cpu_capacity", "memory_capacity(GB)", "cpu_allocatable", "memory_allocatable(GB)", "cpu_requests",  "cpu_limits",  "memory_requests(GB)",  "memory_limits(GB)",  "creation_timestamp"]
 ] + node_rows)
 
 add_heading("CPU概要")
@@ -695,7 +788,7 @@ add_table([
 
 add_heading("内存概要")
 add_table([
-    ["节点IP", "可分配内存(GB)", "内存Requests", "内存Limits", "内存使用率均值(%)", "内存使用率最大(%)"]
+    ["节点IP", "可分配内存(GB)", "内存Requests(GB)", "内存Limits(GB)", "内存使用率均值(%)", "内存使用率最大(%)"]
  ] + memory_summary_rows)
 
 add_heading("存储概要")
@@ -745,10 +838,7 @@ for section in timeseries_sections:
     for img_path in section["images"]:
         path = img_path["path"]
         desc = img_path["desc"]
-        if path.suffix.lower() in (".png", ".jpg", ".jpeg"):
-            add_image(path)
-        else:
-            add_paragraph("图片格式不支持：{}".format(path.name))
+        add_image(path)
         if desc:
             add_paragraph(desc)
 

@@ -911,6 +911,29 @@ fi
 K8S_NODES_END_TS=$(date +%s)
 log_collector_stats "cluster_k8s_nodes" "$K8S_NODES_CSV" "$K8S_NODES_START_TS" "$K8S_NODES_END_TS"
 
+DEVICE_MAPPER_START_TS=$(date +%s)
+log "Collecting device mapper entries (/dev/mapper)"
+DEVICE_MAPPER_CSV="$SNAPSHOTS_DIR/device_mapper.csv"
+echo "mapper_name,device" > "$DEVICE_MAPPER_CSV"
+if [[ -d "/dev/mapper" ]]; then
+  if ls -l /dev/mapper >"$TMP_DIR/device_mapper_ls.txt" 2>/dev/null; then
+    awk '$(NF-2)=="->"{
+      name=$(NF-3);
+      target=$(NF-1);
+      sub(".*/","",target);
+      if(name!="control"){
+        printf "\"%s\",\"%s\"\n", name, target;
+      }
+    }' "$TMP_DIR/device_mapper_ls.txt" >> "$DEVICE_MAPPER_CSV"
+  else
+    log "WARNING: Failed to list /dev/mapper"
+  fi
+else
+  log "WARNING: /dev/mapper not found"
+fi
+DEVICE_MAPPER_END_TS=$(date +%s)
+log_collector_stats "device_mapper" "$DEVICE_MAPPER_CSV" "$DEVICE_MAPPER_START_TS" "$DEVICE_MAPPER_END_TS"
+
 # business 表 TTL 信息输出为 CSV，同时提取 TTL 数值
 BUSINESS_TTL_START_TS=$(date +%s)
 log "Collecting business TTL metadata (CSV)"
