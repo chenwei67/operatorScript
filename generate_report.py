@@ -3,7 +3,7 @@ import csv
 import re
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 input_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./migration_report")
 pdf_path = input_dir / "report.pdf"
@@ -180,7 +180,7 @@ def category_for_file(fname):
         return "业务表写入"
     return "其它时序"
 
-def render_svg(series_list, out_path, title, y_label, x_tick_mode=None):
+def render_svg(series_list, out_path, title, y_label, x_tick_mode=None, x_tick_rotation=-30):
     width = 900
     height = 460
     padding_left = 80
@@ -225,7 +225,7 @@ def render_svg(series_list, out_path, title, y_label, x_tick_mode=None):
             label = dt_tick.strftime("%m-%d %H:00")
         else:
             label = dt_tick.strftime("%m-%d %H:%M")
-        lines.append('<text x="{}" y="{}" font-size="12" font-family="Arial" text-anchor="middle" transform="rotate(-30 {} {})">{}</text>'.format(px, height - padding_bottom + 28, px, height - padding_bottom + 28, label))
+        lines.append('<text x="{}" y="{}" font-size="7" font-family="Arial" text-anchor="middle" transform="rotate({} {} {})">{}</text>'.format(px, height - padding_bottom + 28, x_tick_rotation, px, height - padding_bottom + 28, label))
     y_tick_count = 5
     for i in range(y_tick_count + 1):
         frac = float(i) / float(y_tick_count)
@@ -400,10 +400,20 @@ for pf in prom_files:
                 scaled_map[sk] = [(x, y / (1024.0 ** 3)) for x, y in points]
             series_map = scaled_map
             y_label = "值(GB)"
+        is_business_writes = cat == "业务表写入"
+        if is_business_writes:
+            latest_times = [points[-1][0] for points in series_map.values() if points]
+            if latest_times:
+                window_start = max(latest_times) - timedelta(days=3)
+                filtered_map = {}
+                for sk, points in series_map.items():
+                    filtered_points = [(x, y) for x, y in points if x >= window_start]
+                    if filtered_points:
+                        filtered_map[sk] = filtered_points
+                series_map = filtered_map
         def last_value(points):
             return points[-1][1] if points else float("-inf")
         sorted_series = sorted(series_map.items(), key=lambda kv: last_value(kv[1]), reverse=True)[:10]
-        is_business_writes = cat == "业务表写入"
         if plot_mode == "matplotlib":
             plt.figure(figsize=(10, 5))
             try:
@@ -417,6 +427,9 @@ for pf in prom_files:
                     formatter = mdates.ConciseDateFormatter(locator)
                 ax.xaxis.set_major_locator(locator)
                 ax.xaxis.set_major_formatter(formatter)
+                ax.tick_params(axis="x", labelsize=8)
+                if is_business_writes:
+                    plt.setp(ax.get_xticklabels(), rotation=90, ha="center", va="center")
             except Exception:
                 pass
             for sk, points in sorted_series:
@@ -439,7 +452,7 @@ for pf in prom_files:
                 plt.close()
         else:
             out_path = cat_dir / ("{}.svg".format(mname))
-            render_svg(sorted_series, out_path, "{} ({})".format(mname, pf.name), y_label, x_tick_mode="hour" if is_business_writes else None)
+            render_svg(sorted_series, out_path, "{} ({})".format(mname, pf.name), y_label, x_tick_mode="hour" if is_business_writes else None, x_tick_rotation=90 if is_business_writes else -30)
         section["images"].append({"path": out_path, "desc": metric_desc(mname, y_label)})
     timeseries_sections.append(section)
 

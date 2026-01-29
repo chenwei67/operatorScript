@@ -1,5 +1,0 @@
-name,internal_ip,os_image,kernel_version,cpu_capacity,memory_capacity,cpu_allocatable,memory_allocatable,creation_timestamp
-"dmoc-fefcfe3fc68e","100.255.255.21","PlatOS 1.3 (LTS)","4.19.90-25.17.230.po1.x86_64","32","263566596Ki","29","254129412Ki","2025-10-16T06:40:01Z"
-"dmoc-fefcfe633515","100.255.255.24","PlatOS 1.3 (LTS)","4.19.90-25.17.230.po1.x86_64","32","263566596Ki","29","254129412Ki","2025-10-16T06:40:14Z"
-"dmoc-fefcfe77fdd9","100.255.255.22","PlatOS 1.3 (LTS)","4.19.90-25.17.230.po1.x86_64","32","263566596Ki","29","254129412Ki","2025-10-16T06:40:15Z"
-"dmoc-fefcfea2f8d9","100.255.255.23","PlatOS 1.3 (LTS)","4.19.90-25.17.230.po1.x86_64","32","263566596Ki","29","254129412Ki","2025-10-16T06:39:42Z"
