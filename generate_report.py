@@ -13,6 +13,9 @@ def read_csv(path: Path):
     with path.open(newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
+def get_value(row, key, default=""):
+    return row.get(key, default)
+
 def to_gb(value):
     try:
         return "{:.2f}".format(float(value) / (1024 ** 3))
@@ -37,15 +40,23 @@ cpu_value = "{}（{}）".format(cpu_flags, avx2_supported) if cpu_flags else avx
 k8s_nodes = read_csv(input_dir / "snapshots/cluster_k8s_nodes.csv")
 node_rows = [
     [
-        r["name"],
-        r["internal_ip"],
-        r["os_image"],
-        r["kernel_version"],
-        r["cpu_capacity"],
-        to_gb_from_kib(r["memory_capacity"]),
-        r["cpu_allocatable"],
-        to_gb_from_kib(r["memory_allocatable"]),
-        r["creation_timestamp"],
+        get_value(r, "name"),
+        get_value(r, "internal_ip"),
+        get_value(r, "os_image"),
+        get_value(r, "kernel_version"),
+        get_value(r, "cpu_capacity"),
+        to_gb_from_kib(get_value(r, "memory_capacity")),
+        get_value(r, "cpu_allocatable"),
+        to_gb_from_kib(get_value(r, "memory_allocatable")),
+        get_value(r, "cpu_requests"),
+        get_value(r, "cpu_requests_percent"),
+        get_value(r, "cpu_limits"),
+        get_value(r, "cpu_limits_percent"),
+        get_value(r, "memory_requests"),
+        get_value(r, "memory_requests_percent"),
+        get_value(r, "memory_limits"),
+        get_value(r, "memory_limits_percent"),
+        get_value(r, "creation_timestamp"),
     ]
     for r in k8s_nodes
 ]
@@ -71,12 +82,13 @@ ttl_rows = [
 ]
 
 table_stats = read_csv(input_dir / "table_stats.csv")
-business_rows = [r for r in table_stats if r["database"] == "business"]
+business_rows_all = [r for r in table_stats if r["database"] == "business"]
+business_rows = [r for r in business_rows_all if r.get("engine") != "Distributed"]
 business_zero = sum(1 for r in business_rows if int(float(r["total_rows"])) == 0)
 business_nonzero = sum(1 for r in business_rows if int(float(r["total_rows"])) > 0)
 
 top10 = sorted(
-    business_rows,
+    business_rows_all,
     key=lambda r: float(r["uncompressed_size_bytes"]),
     reverse=True,
 )[:10]
@@ -94,15 +106,16 @@ top10_rows = [
 
 time_range = read_csv(input_dir / "timeseries/query_time_range_distribution_strict_by_user_group.csv")
 non_human = [r for r in time_range if r["user_group"] == "__NON_HUMAN__"]
-non_human_sorted = sorted(non_human, key=lambda r: float(r["p99_days"]), reverse=True)[:10]
+non_human_sorted = sorted(non_human, key=lambda r: float(r.get("p99_days") or 0), reverse=True)[:10]
 time_rows = [
     [
-        r["table_name"],
-        r["p50_days"],
-        r["p80_days"],
-        r["p90_days"],
-        r["p95_days"],
-        r["p99_days"],
+        r.get("table_name", r.get("table", "")),
+        r.get("p50_days", ""),
+        r.get("p80_days", ""),
+        r.get("p90_days", ""),
+        r.get("p95_days", ""),
+        r.get("p99_days", ""),
+        r.get("p100_days", ""),
     ]
     for r in non_human_sorted
 ]
@@ -166,6 +179,49 @@ def label_repr(labels):
             return "{}={}".format(key, labels[key])
     items = ["{}={}".format(k, labels[k]) for k in sorted(labels.keys())]
     return ",".join(items) if items else "all"
+
+def format_number(value):
+    try:
+        return "{:.2f}".format(float(value))
+    except Exception:
+        return ""
+
+def series_avg(points):
+    if not points:
+        return ""
+    return format_number(sum(p[1] for p in points) / float(len(points)))
+
+def series_max(points):
+    if not points:
+        return ""
+    return format_number(max(p[1] for p in points))
+
+def series_latest(points):
+    if not points:
+        return None
+    return points[-1][1]
+
+def get_series_points(metrics, metric_name, instance, device=None):
+    series_map = metrics.get(metric_name, {})
+    keys = []
+    if device:
+        keys.append("instance={} device={}".format(instance, device))
+    if instance:
+        keys.append("instance={}".format(instance))
+    for key in keys:
+        if key in series_map:
+            return series_map[key]
+    return []
+
+def parse_instance_device(series_key):
+    instance = None
+    device = None
+    for part in series_key.split(" "):
+        if part.startswith("instance="):
+            instance = part[len("instance="):]
+        elif part.startswith("device="):
+            device = part[len("device="):]
+    return instance, device
 
 def category_for_file(fname):
     if fname == "cluster_node_usage_timeseries.prom":
@@ -367,6 +423,75 @@ for pf in prom_files:
             metrics[mname][sk].sort(key=lambda x: x[0])
     file_metrics[str(pf)] = metrics
 
+node_usage_metrics = file_metrics.get(str(timeseries_dir / "cluster_node_usage_timeseries.prom"), {})
+filesystem_metrics = file_metrics.get(str(timeseries_dir / "cluster_filesystem_usage_timeseries.prom"), {})
+filesystem_total_series = filesystem_metrics.get("sr_migration_cluster_filesystem_total_bytes", {})
+
+def pick_filesystem_device(total_series, instance):
+    max_total = None
+    selected_device = None
+    for key, points in total_series.items():
+        inst, dev = parse_instance_device(key)
+        if inst != instance:
+            continue
+        latest = series_latest(points)
+        if latest is None:
+            continue
+        if max_total is None or latest > max_total:
+            max_total = latest
+            selected_device = dev
+    return selected_device, max_total
+
+cpu_summary_rows = []
+memory_summary_rows = []
+storage_summary_rows = []
+net_summary_rows = []
+for r in k8s_nodes:
+    node_ip = get_value(r, "internal_ip")
+    cpu_summary_rows.append([
+        node_ip,
+        get_value(r, "cpu_allocatable"),
+        get_value(r, "cpu_requests"),
+        get_value(r, "cpu_limits"),
+        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_cpu_usage_percent_avg", node_ip)),
+        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_cpu_usage_percent_max", node_ip)),
+    ])
+    memory_summary_rows.append([
+        node_ip,
+        to_gb_from_kib(get_value(r, "memory_allocatable")),
+        get_value(r, "memory_requests"),
+        get_value(r, "memory_limits"),
+        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_memory_usage_percent_avg", node_ip)),
+        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_memory_usage_percent_max", node_ip)),
+    ])
+    device, total_latest = pick_filesystem_device(filesystem_total_series, node_ip)
+    free_points = get_series_points(filesystem_metrics, "sr_migration_cluster_filesystem_free_bytes", node_ip, device)
+    free_latest = series_latest(free_points)
+    free_percent = ""
+    if free_latest is not None and total_latest not in (None, 0):
+        free_percent = format_number((free_latest / total_latest) * 100.0)
+    storage_summary_rows.append([
+        node_ip,
+        to_gb(total_latest) if total_latest is not None else "",
+        to_gb(free_latest) if free_latest is not None else "",
+        free_percent,
+        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_await_ms_max", node_ip, device)),
+        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_await_ms_avg", node_ip, device)),
+        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_mbps_avg", node_ip, device)),
+        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_mbps_max", node_ip, device)),
+        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_iops_avg", node_ip, device)),
+        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_iops_max", node_ip, device)),
+        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_iops_avg", node_ip, device)),
+        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_iops_max", node_ip, device)),
+    ])
+    net_summary_rows.append([
+        node_ip,
+        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_net_rx_mbps_avg", node_ip)),
+        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_net_rx_mbps_max", node_ip)),
+        series_avg(get_series_points(node_usage_metrics, "sr_migration_cluster_node_net_tx_mbps_avg", node_ip)),
+        series_max(get_series_points(node_usage_metrics, "sr_migration_cluster_node_net_tx_mbps_max", node_ip)),
+    ])
+
 timeseries_sections = []
 for pf in prom_files:
     cat = category_for_file(pf.name)
@@ -560,8 +685,28 @@ add_table([["项目", "值"], ["CPU指令集", cpu_value]])
 
 add_heading("K8S节点信息")
 add_table([
-    ["name", "internal_ip", "os_image", "kernel_version", "cpu_capacity", "memory_capacity_GB", "cpu_allocatable", "memory_allocatable_GB", "creation_timestamp"]
+    ["name", "internal_ip", "os_image", "kernel_version", "cpu_capacity", "memory_capacity_GB", "cpu_allocatable", "memory_allocatable_GB", "cpu_requests", "cpu_requests_percent", "cpu_limits", "cpu_limits_percent", "memory_requests", "memory_requests_percent", "memory_limits", "memory_limits_percent", "creation_timestamp"]
 ] + node_rows)
+
+add_heading("CPU概要")
+add_table([
+    ["节点IP", "可分配CPU", "CPU Requests", "CPU Limits", "CPU使用率均值(%)", "CPU使用率最大(%)"]
+ ] + cpu_summary_rows)
+
+add_heading("内存概要")
+add_table([
+    ["节点IP", "可分配内存(GB)", "内存Requests", "内存Limits", "内存使用率均值(%)", "内存使用率最大(%)"]
+ ] + memory_summary_rows)
+
+add_heading("存储概要")
+add_table([
+    ["节点IP", "文件系统总容量(GB)", "文件系统可用容量(GB)", "可用容量占比(%)", "磁盘await最大(ms)", "磁盘await均值(ms)", "磁盘读吞吐均值(MB/s)", "磁盘读吞吐最大(MB/s)", "磁盘读IOPS均值", "磁盘读IOPS最大", "磁盘写IOPS均值", "磁盘写IOPS最大"]
+ ] + storage_summary_rows)
+
+add_heading("网口概要")
+add_table([
+    ["节点IP", "网络接收均值(MB/s)", "网络接收最大(MB/s)", "网络发送均值(MB/s)", "网络发送最大(MB/s)"]
+ ] + net_summary_rows)
 
 add_heading("存储卷容量(GB)")
 add_table([
@@ -583,7 +728,7 @@ add_heading("business库按未压缩大小降序Top10")
 add_table([["database", "table", "engine", "total_rows", "compressed_size_GB", "uncompressed_size_GB"]] + top10_rows)
 
 add_heading("非人工用户组查询时间范围PXX Top10")
-add_table([["table_name", "p50_days", "p80_days", "p90_days", "p95_days", "p99_days"]] + time_rows)
+add_table([["table_name", "p50_days", "p80_days", "p90_days", "p95_days", "p99_days", "p100_days"]] + time_rows)
 
 add_heading1("其他表")
 add_heading("非business库表列表")

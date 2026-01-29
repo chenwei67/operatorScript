@@ -115,6 +115,12 @@ json_number_or_null() {
   fi
 }
 
+csv_escape() {
+  local value="$1"
+  value=${value//\"/\"\"}
+  printf '%s' "$value"
+}
+
 json_lines_to_array() {
   local src="$1"
   local dest="$2"
@@ -842,8 +848,63 @@ log_collector_stats "cluster_storage_volumes" "$STORAGE_VOLUMES_CSV" "$STORAGE_V
 K8S_NODES_START_TS=$(date +%s)
 log "Collecting K8s cluster node inventory"
 K8S_NODES_CSV="$SNAPSHOTS_DIR/cluster_k8s_nodes.csv"
-echo "name,internal_ip,os_image,kernel_version,cpu_capacity,memory_capacity,cpu_allocatable,memory_allocatable,creation_timestamp" > "$K8S_NODES_CSV"
-if ! kubectl get nodes -o jsonpath='{range .items[*]}"{.metadata.name}","{.status.addresses[?(@.type=="InternalIP")].address}","{.status.nodeInfo.osImage}","{.status.nodeInfo.kernelVersion}","{.status.capacity.cpu}","{.status.capacity.memory}","{.status.allocatable.cpu}","{.status.allocatable.memory}","{.metadata.creationTimestamp}"{"\n"}{end}' >> "$K8S_NODES_CSV" 2>"$TMP_DIR/k8s_nodes.log"; then
+echo "name,internal_ip,os_image,kernel_version,cpu_capacity,memory_capacity,cpu_allocatable,memory_allocatable,cpu_requests,cpu_requests_percent,cpu_limits,cpu_limits_percent,memory_requests,memory_requests_percent,memory_limits,memory_limits_percent,creation_timestamp" > "$K8S_NODES_CSV"
+if kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.addresses[?(@.type=="InternalIP")].address}{"\t"}{.status.nodeInfo.osImage}{"\t"}{.status.nodeInfo.kernelVersion}{"\t"}{.status.capacity.cpu}{"\t"}{.status.capacity.memory}{"\t"}{.status.allocatable.cpu}{"\t"}{.status.allocatable.memory}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}' > "$TMP_DIR/k8s_nodes.tsv" 2>"$TMP_DIR/k8s_nodes.log"; then
+  while IFS=$'\t' read -r node_name internal_ip os_image kernel_version cpu_capacity memory_capacity cpu_allocatable memory_allocatable creation_timestamp; do
+    cpu_requests=""
+    cpu_requests_percent=""
+    cpu_limits=""
+    cpu_limits_percent=""
+    memory_requests=""
+    memory_requests_percent=""
+    memory_limits=""
+    memory_limits_percent=""
+    describe_out=$(kubectl describe node "$node_name" 2>/dev/null || true)
+    if [[ -n "$describe_out" ]]; then
+      while IFS='|' read -r res req req_pct lim lim_pct; do
+        if [[ "$res" == "cpu" ]]; then
+          cpu_requests="$req"
+          cpu_requests_percent="$req_pct"
+          cpu_limits="$lim"
+          cpu_limits_percent="$lim_pct"
+        elif [[ "$res" == "memory" ]]; then
+          memory_requests="$req"
+          memory_requests_percent="$req_pct"
+          memory_limits="$lim"
+          memory_limits_percent="$lim_pct"
+        fi
+      done < <(printf '%s\n' "$describe_out" | awk '
+        $1 == "Allocated" && $2 == "resources:" {in_alloc = 1; next}
+        in_alloc && $1 == "Events:" {exit}
+        in_alloc && ($1 == "cpu" || $1 == "memory") {
+          req = $2; reqp = $3; lim = $4; limp = $5;
+          gsub(/[()%]/, "", reqp);
+          gsub(/[()%]/, "", limp);
+          print $1 "|" req "|" reqp "|" lim "|" limp;
+        }
+      ')
+    fi
+    printf '"%s","%s","%s","%s","%s","%s","%s","%s","%s","%s","%s","%s","%s","%s","%s","%s","%s"\n' \
+      "$(csv_escape "$node_name")" \
+      "$(csv_escape "$internal_ip")" \
+      "$(csv_escape "$os_image")" \
+      "$(csv_escape "$kernel_version")" \
+      "$(csv_escape "$cpu_capacity")" \
+      "$(csv_escape "$memory_capacity")" \
+      "$(csv_escape "$cpu_allocatable")" \
+      "$(csv_escape "$memory_allocatable")" \
+      "$(csv_escape "$cpu_requests")" \
+      "$(csv_escape "$cpu_requests_percent")" \
+      "$(csv_escape "$cpu_limits")" \
+      "$(csv_escape "$cpu_limits_percent")" \
+      "$(csv_escape "$memory_requests")" \
+      "$(csv_escape "$memory_requests_percent")" \
+      "$(csv_escape "$memory_limits")" \
+      "$(csv_escape "$memory_limits_percent")" \
+      "$(csv_escape "$creation_timestamp")" \
+      >> "$K8S_NODES_CSV"
+  done < "$TMP_DIR/k8s_nodes.tsv"
+else
   log "WARNING: Failed to collect node inventory via kubectl"
 fi
 
@@ -1390,7 +1451,7 @@ QUERY_TIME_RANGE_CSV="$TIMESERIES_DIR/query_time_range_distribution.csv"
 QUERY_TIME_RANGE_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_time_range_distribution_by_user_group.csv"
 QUERY_TIME_RANGE_STRICT_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict.csv"
 QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict_by_user_group.csv"
-echo "table,query_count,matched_query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_CSV"
+echo "table,query_count,matched_query_count,p50_days,p80_days,p90_days,p95_days,p99_days,p100_days" >"$QUERY_TIME_RANGE_CSV"
 : >"$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"
 : >"$QUERY_TIME_RANGE_STRICT_CSV"
 : >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
@@ -1541,16 +1602,12 @@ FROM
     table_name,
     count() AS query_count,
     countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
     toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
     toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
     toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
     toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
+    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
   FROM per_query_ranges
   GROUP BY table_name
 
@@ -1560,16 +1617,12 @@ FROM
     '__ALL__' AS table_name,
     count() AS query_count,
     countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
     toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
     toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
     toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
     toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
+    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
   FROM per_query_ranges
 )
 ORDER BY query_count DESC
@@ -1713,7 +1766,7 @@ SQL
     fi
 
     if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
-      echo "user_group,table,query_count,matched_query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"
+      echo "user_group,table,query_count,matched_query_count,p50_days,p80_days,p90_days,p95_days,p99_days,p100_days" >"$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"
       QUERY_TIME_RANGE_BY_USER_GROUP_SQL=$(cat <<SQL
 WITH
     per_query AS (
@@ -1830,16 +1883,12 @@ FROM
     table_name,
     count() AS query_count,
     countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
     toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
     toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
     toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
     toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
+    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
   FROM per_query_ranges
   GROUP BY user_group, table_name
 
@@ -1850,16 +1899,12 @@ FROM
     '__ALL__' AS table_name,
     count() AS query_count,
     countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
     toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
     toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
     toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
     toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
+    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
   FROM per_query_ranges
   GROUP BY user_group
 )
@@ -1879,7 +1924,7 @@ SQL
     log_collector_stats "query_time_range_distribution_by_user_group" "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV" "$QUERY_TIME_RANGE_START_TS" "$QUERY_TIME_RANGE_BY_USER_GROUP_END_TS"
   fi
 
-    echo "table,query_count,matched_query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_CSV"
+    echo "table,query_count,matched_query_count,p50_days,p80_days,p90_days,p95_days,p99_days,p100_days" >"$QUERY_TIME_RANGE_STRICT_CSV"
     QUERY_TIME_RANGE_STRICT_START_TS=$(date +%s)
     QUERY_TIME_RANGE_STRICT_SQL=$(cat <<SQL
 WITH
@@ -1972,16 +2017,12 @@ FROM
     table_name,
     count() AS query_count,
     countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
     toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
     toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
     toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
     toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
+    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
   FROM per_query_ranges
   GROUP BY table_name
 
@@ -1991,16 +2032,12 @@ FROM
     '__ALL__' AS table_name,
     count() AS query_count,
     countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
     toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
     toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
     toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
     toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
+    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
   FROM per_query_ranges
 )
 ORDER BY query_count DESC
@@ -2016,7 +2053,7 @@ SQL
     log_collector_stats "query_time_range_distribution_strict" "$QUERY_TIME_RANGE_STRICT_CSV" "$QUERY_TIME_RANGE_STRICT_START_TS" "$QUERY_TIME_RANGE_STRICT_END_TS"
 
     if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
-      echo "user_group,table,query_count,matched_query_count,ratio_7d,ratio_15d,ratio_30d,ratio_60d,ratio_90d,p50_days,p80_days,p90_days,p95_days,p99_days" >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
+      echo "user_group,table,query_count,matched_query_count,p50_days,p80_days,p90_days,p95_days,p99_days,p100_days" >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
       QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_SQL=$(cat <<SQL
 WITH
     per_query AS (
@@ -2112,16 +2149,12 @@ FROM
     table_name,
     count() AS query_count,
     countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
     toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
     toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
     toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
     toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
+    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
   FROM per_query_ranges
   GROUP BY user_group, table_name
 
@@ -2132,16 +2165,12 @@ FROM
     '__ALL__' AS table_name,
     count() AS query_count,
     countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 7) / count(), 0.0), 2) AS ratio_7d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 15) / count(), 0.0), 2) AS ratio_15d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 30) / count(), 0.0), 2) AS ratio_30d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 60) / count(), 0.0), 2) AS ratio_60d,
-    toDecimal32(if(count() > 0, countIf(estimated_days_range > 0 AND estimated_days_range <= 90) / count(), 0.0), 2) AS ratio_90d,
     toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
     toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
     toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
     toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days
+    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
+    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
   FROM per_query_ranges
   GROUP BY user_group
 )
