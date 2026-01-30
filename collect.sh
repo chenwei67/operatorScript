@@ -25,8 +25,8 @@ Optional options:
   --vm-namespace NAME                Namespace where VictoriaMetrics runs (default "monitor-platform" or VM_NAMESPACE)
   --vm-port PORT                     VMSelect port (default 8481 or VM_PORT)
   --vm-tenant-id ID                  VictoriaMetrics tenant/account ID (default 0 or VM_TENANT_ID)
-  --vm-bucket-interval-minutes MINS  VM downsample bucket size (default 60 or VM_BUCKET_INTERVAL_MINUTES)
-  --vm-rate-window DURATION          PromQL rate() window (default 5m or VM_RATE_WINDOW)
+  --vm-bucket-interval-minutes MINS  VM downsample bucket size (default 3 or VM_BUCKET_INTERVAL_MINUTES)
+  --vm-rate-window DURATION          PromQL rate() window (default 3m or VM_RATE_WINDOW)
   --vm-node-selector SELECTOR        Selector snippet injected into node-level PromQL
   --vm-ck-pod-selector SELECTOR      Selector snippet injected into CK pod PromQL
   --chi-name NAME                    ClickHouseInstallation name (default "pro" or CHI_NAME)
@@ -149,8 +149,8 @@ VM_SERVICE="${VM_SERVICE:-vmselect-vmcluster}"
 VM_NAMESPACE="${VM_NAMESPACE:-monitor-platform}"
 VM_PORT="${VM_PORT:-8481}"
 VM_TENANT_ID="${VM_TENANT_ID:-0}"
-VM_BUCKET_INTERVAL_MINUTES="${VM_BUCKET_INTERVAL_MINUTES:-60}"
-VM_RATE_WINDOW="${VM_RATE_WINDOW:-5m}"
+VM_BUCKET_INTERVAL_MINUTES="${VM_BUCKET_INTERVAL_MINUTES:-3}"
+VM_RATE_WINDOW="${VM_RATE_WINDOW:-3m}"
 VM_NODE_SELECTOR="${VM_NODE_SELECTOR:-}"
 VM_CK_POD_SELECTOR="${VM_CK_POD_SELECTOR:-}"
 CK_HELM_NAMESPACE="${CK_HELM_NAMESPACE:-ck}"
@@ -386,7 +386,7 @@ VM_BUCKET_INTERVAL_MINUTES=$((VM_BUCKET_INTERVAL_MINUTES))
 (( QUERY_TIME_RANGE_DAYS <= 0 )) && QUERY_TIME_RANGE_DAYS=30
 (( QUERY_TIME_RANGE_MAX_THREADS <= 0 )) && QUERY_TIME_RANGE_MAX_THREADS=2
 (( QUERY_TIME_RANGE_MAX_SECONDS <= 0 )) && QUERY_TIME_RANGE_MAX_SECONDS=300
-(( VM_BUCKET_INTERVAL_MINUTES <= 0 )) && VM_BUCKET_INTERVAL_MINUTES=60
+(( VM_BUCKET_INTERVAL_MINUTES <= 0 )) && VM_BUCKET_INTERVAL_MINUTES=3
 RESOURCE_HISTORY_MINUTES=$((RESOURCE_HISTORY_DAYS * 24 * 60))
 if (( RESOURCE_HISTORY_MINUTES < BUCKET_INTERVAL_MINUTES )); then
   RESOURCE_HISTORY_MINUTES=$BUCKET_INTERVAL_MINUTES
@@ -917,9 +917,9 @@ DEVICE_MAPPER_CSV="$SNAPSHOTS_DIR/device_mapper.csv"
 echo "mapper_name,device" > "$DEVICE_MAPPER_CSV"
 if [[ -d "/dev/mapper" ]]; then
   if ls -l /dev/mapper >"$TMP_DIR/device_mapper_ls.txt" 2>/dev/null; then
-    awk '$(NF-2)=="->"{
-      name=$(NF-3);
-      target=$(NF-1);
+    awk '$(NF-1)=="->"{
+      name=$(NF-2);
+      target=$(NF);
       sub(".*/","",target);
       if(name!="control"){
         printf "\"%s\",\"%s\"\n", name, target;
@@ -1470,14 +1470,8 @@ else
 fi
 
 log "Collecting query time range distribution (last ${QUERY_TIME_RANGE_DAYS} days)"
-QUERY_TIME_RANGE_CSV="$TIMESERIES_DIR/query_time_range_distribution.csv"
 QUERY_TIME_RANGE_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_time_range_distribution_by_user_group.csv"
-QUERY_TIME_RANGE_STRICT_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict.csv"
-QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV="$TIMESERIES_DIR/query_time_range_distribution_strict_by_user_group.csv"
-echo "table,query_count,matched_query_count,p50_days,p80_days,p90_days,p95_days,p99_days,p100_days" >"$QUERY_TIME_RANGE_CSV"
 : >"$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"
-: >"$QUERY_TIME_RANGE_STRICT_CSV"
-: >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
 QUERY_TIME_RANGE_START_TS=$(date +%s)
 if ck_has_column "system" "query_log" "tables"; then
   QUERY_LOG_FILTER=""
@@ -1513,153 +1507,6 @@ if ck_has_column "system" "query_log" "tables"; then
     log "WARNING: business-time-config parsed empty. Skipping query time range distribution."
     QUERY_TIME_RANGE_BY_USER_GROUP_CSV=""
   else
-    QUERY_TIME_RANGE_SQL=$(cat <<SQL
-WITH
-    per_query AS (
-      SELECT *
-      FROM
-      (
-        SELECT
-          ql.event_time,
-          $TABLE_DB_EXPR,
-          $TABLE_TBL_EXPR,
-          multiIf($IN_CONFIG_CASES 0) AS in_config,
-
-          extractAll(ql.query, '(?i)INTERVAL\\s+(\\d+)\\s+DAY') AS interval_days_matches,
-          extractAll(ql.query, '(?i)INTERVAL\\s+(\\d+)\\s+HOUR') AS interval_hours_matches,
-          extractAll(ql.query, '(\\d{4}-\\d{2}-\\d{2})') AS all_date_strs,
-          extractAll(ql.query, '(?i)(?:>|>=)[^0-9]{0,32}(\\d{4}-\\d{2}-\\d{2})') AS greater_than_matches,
-
-          multiIf($TS_START_CASES []) AS ts_start_matches,
-          multiIf($TS_END_CASES []) AS ts_end_matches,
-          multiIf($TS_START_DATE_CASES []) AS date_start_matches,
-          multiIf($TS_END_DATE_CASES []) AS date_end_matches
-        FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log) AS ql
-        ARRAY JOIN ql.tables AS t
-        WHERE
-          ql.event_time >= now() - INTERVAL {query_time_range_days:Int32} DAY
-          $QUERY_LOG_FILTER
-          AND ql.type = 'QueryFinish'
-          AND ql.is_initial_query = 1
-          AND ql.query_kind = 'Select'
-          AND has(ql.databases, {CK_DATABASE_BUSINESS:String})
-          AND (
-            startsWith(t, concat({CK_DATABASE_BUSINESS:String}, '.'))
-            OR
-            (position(t, '.') = 0 AND has(ql.databases, {CK_DATABASE_BUSINESS:String}))
-          )
-      )
-      WHERE in_config = 1
-    ),
-    per_query_ranges AS (
-      SELECT
-        table_name,
-        multiIf(
-          ts_start_dt > toDateTime(0) AND ts_end_dt > toDateTime(0) AND ts_end_dt >= ts_start_dt,
-            greatest(1.0, dateDiff('second', ts_start_dt, ts_end_dt) / 86400.0),
-          ts_start_dt > toDateTime(0),
-            greatest(1.0, dateDiff('second', ts_start_dt, event_time) / 86400.0),
-          date_start_dt > toDateTime(0) AND date_end_dt > toDateTime(0) AND date_end_dt >= date_start_dt,
-            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(date_end_dt)) + 1)),
-          date_start_dt > toDateTime(0),
-            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(event_time)) + 1)),
-          length(interval_days_matches) > 0,
-            toFloat64(arrayMax(arrayMap(x -> toInt64OrZero(x), interval_days_matches))),
-          length(interval_hours_matches) > 0,
-            toFloat64(arrayMax(arrayMap(x -> toInt64OrZero(x), interval_hours_matches))) / 24.0,
-          length(start_daynums) > 0,
-            greatest(1.0, toFloat64(toRelativeDayNum(toDate(event_time)) - arrayMax(start_daynums) + 1)),
-          length(valid_daynums) >= 2,
-            greatest(1.0, toFloat64(arrayMax(valid_daynums) - arrayMin(valid_daynums) + 1)),
-          0.0
-        ) AS estimated_days_range
-      FROM
-      (
-        SELECT
-          event_time,
-          table_tbl AS table_name,
-          interval_days_matches,
-          interval_hours_matches,
-          all_date_strs,
-          greater_than_matches,
-          ts_start_matches,
-          ts_end_matches,
-          date_start_matches,
-          date_end_matches,
-          if(length(ts_start_matches) > 0, arrayMax(arrayMap(x -> toInt64OrZero(x), ts_start_matches)), toInt64(0)) AS ts_start_raw,
-          if(
-            length(ts_end_matches) > 0,
-            if(
-              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches)) = toInt64(9223372036854775807),
-              toInt64(0),
-              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches))
-            ),
-            toInt64(0)
-          ) AS ts_end_raw,
-          if(ts_start_raw > 0, toDateTime(ts_start_raw), toDateTime(0)) AS ts_start_dt,
-          if(ts_end_raw > 0, toDateTime(ts_end_raw), toDateTime(0)) AS ts_end_dt,
-          arrayFilter(d -> d > toDate(0), arrayMap(x -> toDateOrZero(x), all_date_strs)) AS valid_dates,
-          arrayMap(d -> toRelativeDayNum(d), valid_dates) AS valid_daynums,
-          arrayFilter(d -> d > toDate(0), arrayMap(x -> toDateOrZero(extract(x, '\\d{4}-\\d{2}-\\d{2}')), greater_than_matches)) AS start_dates,
-          arrayMap(d -> toRelativeDayNum(d), start_dates) AS start_daynums,
-          if(length(date_start_matches) > 0, arrayMax(arrayMap(x -> toInt32(toRelativeDayNum(toDateOrZero(x))), date_start_matches)), toInt32(0)) AS date_start_daynum,
-          if(
-            length(date_end_matches) > 0,
-            if(
-              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches)) = toInt32(2147483647),
-              toInt32(0),
-              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches))
-            ),
-            toInt32(0)
-          ) AS date_end_daynum,
-          if(date_start_daynum > 0, toDateTime(addDays(toDate(0), date_start_daynum)), toDateTime(0)) AS date_start_dt,
-          if(date_end_daynum > 0, toDateTime(addDays(toDate(0), date_end_daynum)), toDateTime(0)) AS date_end_dt
-        FROM per_query
-      )
-    )
-
-SELECT *
-FROM
-(
-  SELECT
-    table_name,
-    count() AS query_count,
-    countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
-    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
-    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
-    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
-    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
-  FROM per_query_ranges
-  GROUP BY table_name
-
-  UNION ALL
-
-  SELECT
-    '__ALL__' AS table_name,
-    count() AS query_count,
-    countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
-    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
-    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
-    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
-    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
-  FROM per_query_ranges
-)
-ORDER BY query_count DESC
-SETTINGS
-  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
-  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
-SQL
-)
-    if ! run_clickhouse_to_csv "$QUERY_TIME_RANGE_SQL" "$QUERY_TIME_RANGE_CSV"; then
-      log "WARNING: Failed to collect query time range distribution"
-    fi
-    QUERY_TIME_RANGE_END_TS=$(date +%s)
-    log_collector_stats "query_time_range_distribution" "$QUERY_TIME_RANGE_CSV" "$QUERY_TIME_RANGE_START_TS" "$QUERY_TIME_RANGE_END_TS"
-
     if [[ "$DEBUG" == "true" ]]; then
       QUERY_TIME_RANGE_STATEMENTS_TSV="$TMP_DIR/query_time_range_statements.tsv"
       QUERY_TIME_RANGE_STATEMENTS_SQL=$(cat <<SQL
@@ -1946,272 +1793,7 @@ SQL
     QUERY_TIME_RANGE_BY_USER_GROUP_END_TS=$(date +%s)
     log_collector_stats "query_time_range_distribution_by_user_group" "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV" "$QUERY_TIME_RANGE_START_TS" "$QUERY_TIME_RANGE_BY_USER_GROUP_END_TS"
   fi
-
-    echo "table,query_count,matched_query_count,p50_days,p80_days,p90_days,p95_days,p99_days,p100_days" >"$QUERY_TIME_RANGE_STRICT_CSV"
-    QUERY_TIME_RANGE_STRICT_START_TS=$(date +%s)
-    QUERY_TIME_RANGE_STRICT_SQL=$(cat <<SQL
-WITH
-    per_query AS (
-      SELECT *
-      FROM
-      (
-        SELECT
-          ql.event_time,
-          $TABLE_DB_EXPR,
-          $TABLE_TBL_EXPR,
-          multiIf($IN_CONFIG_CASES 0) AS in_config,
-
-          multiIf($TS_START_CASES []) AS ts_start_matches,
-          multiIf($TS_END_CASES []) AS ts_end_matches,
-          multiIf($TS_START_DATE_CASES []) AS date_start_matches,
-          multiIf($TS_END_DATE_CASES []) AS date_end_matches
-        FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log) AS ql
-        ARRAY JOIN ql.tables AS t
-        WHERE
-          ql.event_time >= now() - INTERVAL {query_time_range_days:Int32} DAY
-          $QUERY_LOG_FILTER
-          AND ql.type = 'QueryFinish'
-          AND ql.is_initial_query = 1
-          AND ql.query_kind = 'Select'
-          AND has(ql.databases, {CK_DATABASE_BUSINESS:String})
-          AND (
-            startsWith(t, concat({CK_DATABASE_BUSINESS:String}, '.'))
-            OR
-            (position(t, '.') = 0 AND has(ql.databases, {CK_DATABASE_BUSINESS:String}))
-          )
-      )
-      WHERE in_config = 1
-    ),
-    per_query_ranges AS (
-      SELECT
-        table_name,
-        multiIf(
-          ts_start_dt > toDateTime(0) AND ts_end_dt > toDateTime(0) AND ts_end_dt >= ts_start_dt,
-            greatest(1.0, dateDiff('second', ts_start_dt, ts_end_dt) / 86400.0),
-          ts_start_dt > toDateTime(0),
-            greatest(1.0, dateDiff('second', ts_start_dt, event_time) / 86400.0),
-          date_start_dt > toDateTime(0) AND date_end_dt > toDateTime(0) AND date_end_dt >= date_start_dt,
-            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(date_end_dt)) + 1)),
-          date_start_dt > toDateTime(0),
-            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(event_time)) + 1)),
-          0.0
-        ) AS estimated_days_range
-      FROM
-      (
-        SELECT
-          event_time,
-          table_tbl AS table_name,
-          ts_start_matches,
-          ts_end_matches,
-          date_start_matches,
-          date_end_matches,
-          if(length(ts_start_matches) > 0, arrayMax(arrayMap(x -> toInt64OrZero(x), ts_start_matches)), toInt64(0)) AS ts_start_raw,
-          if(
-            length(ts_end_matches) > 0,
-            if(
-              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches)) = toInt64(9223372036854775807),
-              toInt64(0),
-              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches))
-            ),
-            toInt64(0)
-          ) AS ts_end_raw,
-          if(ts_start_raw > 0, toDateTime(ts_start_raw), toDateTime(0)) AS ts_start_dt,
-          if(ts_end_raw > 0, toDateTime(ts_end_raw), toDateTime(0)) AS ts_end_dt,
-          if(length(date_start_matches) > 0, arrayMax(arrayMap(x -> toInt32(toRelativeDayNum(toDateOrZero(x))), date_start_matches)), toInt32(0)) AS date_start_daynum,
-          if(
-            length(date_end_matches) > 0,
-            if(
-              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches)) = toInt32(2147483647),
-              toInt32(0),
-              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches))
-            ),
-            toInt32(0)
-          ) AS date_end_daynum,
-          if(date_start_daynum > 0, toDateTime(addDays(toDate(0), date_start_daynum)), toDateTime(0)) AS date_start_dt,
-          if(date_end_daynum > 0, toDateTime(addDays(toDate(0), date_end_daynum)), toDateTime(0)) AS date_end_dt
-        FROM per_query
-      )
-    )
-
-SELECT *
-FROM
-(
-  SELECT
-    table_name,
-    count() AS query_count,
-    countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
-    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
-    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
-    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
-    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
-  FROM per_query_ranges
-  GROUP BY table_name
-
-  UNION ALL
-
-  SELECT
-    '__ALL__' AS table_name,
-    count() AS query_count,
-    countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
-    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
-    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
-    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
-    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
-  FROM per_query_ranges
-)
-ORDER BY query_count DESC
-SETTINGS
-  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
-  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
-SQL
-)
-    if ! run_clickhouse_to_csv "$QUERY_TIME_RANGE_STRICT_SQL" "$QUERY_TIME_RANGE_STRICT_CSV"; then
-      log "WARNING: Failed to collect strict query time range distribution"
-    fi
-    QUERY_TIME_RANGE_STRICT_END_TS=$(date +%s)
-    log_collector_stats "query_time_range_distribution_strict" "$QUERY_TIME_RANGE_STRICT_CSV" "$QUERY_TIME_RANGE_STRICT_START_TS" "$QUERY_TIME_RANGE_STRICT_END_TS"
-
-    if [[ -n "$QUERY_LOG_USER_COLUMN" ]]; then
-      echo "user_group,table,query_count,matched_query_count,p50_days,p80_days,p90_days,p95_days,p99_days,p100_days" >"$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"
-      QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_SQL=$(cat <<SQL
-WITH
-    per_query AS (
-      SELECT *
-      FROM
-      (
-        SELECT
-          if(ql.$QUERY_LOG_USER_COLUMN = 'user_xdr_log_search_readonly', 'user_xdr_log_search_readonly', '__NON_HUMAN__') AS user_group,
-          ql.event_time,
-          $TABLE_DB_EXPR,
-          $TABLE_TBL_EXPR,
-          multiIf($IN_CONFIG_CASES 0) AS in_config,
-
-          multiIf($TS_START_CASES []) AS ts_start_matches,
-          multiIf($TS_END_CASES []) AS ts_end_matches,
-          multiIf($TS_START_DATE_CASES []) AS date_start_matches,
-          multiIf($TS_END_DATE_CASES []) AS date_end_matches
-        FROM clusterAllReplicas('${CK_CLUSTER_NAME}', system.query_log) AS ql
-        ARRAY JOIN ql.tables AS t
-        WHERE
-          ql.event_time >= now() - INTERVAL {query_time_range_days:Int32} DAY
-          $QUERY_LOG_FILTER
-          AND ql.type = 'QueryFinish'
-          AND ql.is_initial_query = 1
-          AND ql.query_kind = 'Select'
-          AND has(ql.databases, {CK_DATABASE_BUSINESS:String})
-          AND (
-            startsWith(t, concat({CK_DATABASE_BUSINESS:String}, '.'))
-            OR
-            (position(t, '.') = 0 AND has(ql.databases, {CK_DATABASE_BUSINESS:String}))
-          )
-      )
-      WHERE in_config = 1
-    ),
-    per_query_ranges AS (
-      SELECT
-        user_group,
-        table_name,
-        multiIf(
-          ts_start_dt > toDateTime(0) AND ts_end_dt > toDateTime(0) AND ts_end_dt >= ts_start_dt,
-            greatest(1.0, dateDiff('second', ts_start_dt, ts_end_dt) / 86400.0),
-          ts_start_dt > toDateTime(0),
-            greatest(1.0, dateDiff('second', ts_start_dt, event_time) / 86400.0),
-          date_start_dt > toDateTime(0) AND date_end_dt > toDateTime(0) AND date_end_dt >= date_start_dt,
-            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(date_end_dt)) + 1)),
-          date_start_dt > toDateTime(0),
-            greatest(1.0, toFloat64(dateDiff('day', toDate(date_start_dt), toDate(event_time)) + 1)),
-          0.0
-        ) AS estimated_days_range
-      FROM
-      (
-        SELECT
-          user_group,
-          event_time,
-          table_tbl AS table_name,
-          ts_start_matches,
-          ts_end_matches,
-          date_start_matches,
-          date_end_matches,
-          if(length(ts_start_matches) > 0, arrayMax(arrayMap(x -> toInt64OrZero(x), ts_start_matches)), toInt64(0)) AS ts_start_raw,
-          if(
-            length(ts_end_matches) > 0,
-            if(
-              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches)) = toInt64(9223372036854775807),
-              toInt64(0),
-              arrayMin(arrayMap(x -> if(toInt64OrZero(x) > 0, toInt64OrZero(x), toInt64(9223372036854775807)), ts_end_matches))
-            ),
-            toInt64(0)
-          ) AS ts_end_raw,
-          if(ts_start_raw > 0, toDateTime(ts_start_raw), toDateTime(0)) AS ts_start_dt,
-          if(ts_end_raw > 0, toDateTime(ts_end_raw), toDateTime(0)) AS ts_end_dt,
-          if(length(date_start_matches) > 0, arrayMax(arrayMap(x -> toInt32(toRelativeDayNum(toDateOrZero(x))), date_start_matches)), toInt32(0)) AS date_start_daynum,
-          if(
-            length(date_end_matches) > 0,
-            if(
-              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches)) = toInt32(2147483647),
-              toInt32(0),
-              arrayMin(arrayMap(x -> if(toInt32(toRelativeDayNum(toDateOrZero(x))) > 0, toInt32(toRelativeDayNum(toDateOrZero(x))), toInt32(2147483647)), date_end_matches))
-            ),
-            toInt32(0)
-          ) AS date_end_daynum,
-          if(date_start_daynum > 0, toDateTime(addDays(toDate(0), date_start_daynum)), toDateTime(0)) AS date_start_dt,
-          if(date_end_daynum > 0, toDateTime(addDays(toDate(0), date_end_daynum)), toDateTime(0)) AS date_end_dt
-        FROM per_query
-      )
-    )
-
-SELECT *
-FROM
-(
-  SELECT
-    user_group,
-    table_name,
-    count() AS query_count,
-    countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
-    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
-    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
-    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
-    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
-  FROM per_query_ranges
-  GROUP BY user_group, table_name
-
-  UNION ALL
-
-  SELECT
-    user_group,
-    '__ALL__' AS table_name,
-    count() AS query_count,
-    countIf(estimated_days_range > 0) AS matched_query_count,
-    toDecimal32(if(count() > 0, quantile(0.5)(estimated_days_range), 0.0), 2) AS p50_days,
-    toDecimal32(if(count() > 0, quantile(0.8)(estimated_days_range), 0.0), 2) AS p80_days,
-    toDecimal32(if(count() > 0, quantile(0.9)(estimated_days_range), 0.0), 2) AS p90_days,
-    toDecimal32(if(count() > 0, quantile(0.95)(estimated_days_range), 0.0), 2) AS p95_days,
-    toDecimal32(if(count() > 0, quantile(0.99)(estimated_days_range), 0.0), 2) AS p99_days,
-    toDecimal32(if(count() > 0, max(estimated_days_range), 0.0), 2) AS p100_days
-  FROM per_query_ranges
-  GROUP BY user_group
-)
-ORDER BY query_count DESC
-SETTINGS
-  max_threads = $QUERY_TIME_RANGE_MAX_THREADS,
-  max_execution_time = $QUERY_TIME_RANGE_MAX_SECONDS
-SQL
-)
-      if ! run_clickhouse_to_csv "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_SQL" "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV"; then
-        log "WARNING: Failed to collect strict query time range distribution by user group"
-      fi
-      QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_END_TS=$(date +%s)
-      log_collector_stats "query_time_range_distribution_strict_by_user_group" "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV" "$QUERY_TIME_RANGE_STRICT_START_TS" "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_END_TS"
-    else
-      QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV=""
-    fi
-  fi
+fi
 
 PARTS_SNAPSHOT_START_TS=$(date +%s)
 log "Collecting parts and partitions snapshot (CSV)"
@@ -2600,7 +2182,7 @@ log_collector_stats "business_table_writes" "$BUSINESS_WRITES_PROM" "$BUSINESS_W
 
 VM_STEP_SECONDS=$((VM_BUCKET_INTERVAL_MINUTES * 60))
 if (( VM_STEP_SECONDS <= 0 )); then
-  VM_STEP_SECONDS=3600
+  VM_STEP_SECONDS=180
 fi
 VM_RESOURCE_BUCKET_COUNT=$((RESOURCE_HISTORY_MINUTES / VM_BUCKET_INTERVAL_MINUTES))
 if (( RESOURCE_HISTORY_MINUTES % VM_BUCKET_INTERVAL_MINUTES != 0 )); then
@@ -2638,10 +2220,10 @@ CK_POD_MEM_BASE=$(printf 'sum by (pod) (container_memory_working_set_bytes{names
 CK_POD_MEM_USAGE_BASE=$(printf 'sum by (pod) (container_memory_usage_bytes{namespace="%s", container!="POD", container!=""})' "$CK_K8S_NAMESPACE")
 CK_POD_NET_RX_BASE=$(printf 'sum by (pod) (rate(container_network_receive_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
 CK_POD_NET_TX_BASE=$(printf 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
-CK_POD_DISK_R_BASE=$(printf 'sum by (pod, device) (rate(container_fs_reads_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
-CK_POD_DISK_W_BASE=$(printf 'sum by (pod, device) (rate(container_fs_writes_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
-CK_POD_DISK_READ_IOPS_BASE=$(printf 'sum by (pod, device) (rate(container_fs_reads_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
-CK_POD_DISK_WRITE_IOPS_BASE=$(printf 'sum by (pod, device) (rate(container_fs_writes_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
+# CK_POD_DISK_R_BASE=$(printf 'sum by (pod, device) (rate(container_fs_reads_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
+# CK_POD_DISK_W_BASE=$(printf 'sum by (pod, device) (rate(container_fs_writes_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
+# CK_POD_DISK_READ_IOPS_BASE=$(printf 'sum by (pod, device) (rate(container_fs_reads_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
+# CK_POD_DISK_WRITE_IOPS_BASE=$(printf 'sum by (pod, device) (rate(container_fs_writes_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
 CK_POD_THROTTLE_BASE=$(printf 'sum by (pod) (rate(container_cpu_cfs_throttled_seconds_total{namespace="%s", container!="POD", container!=""}[%s])) * 100' "$CK_K8S_NAMESPACE" "$VM_RATE_WINDOW")
 CK_POD_CPU_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="%s", container!="POD", container!=""}[%s])) * 100' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_CPU_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_CPU_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
@@ -2653,14 +2235,14 @@ CK_POD_NET_RX_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_network_receive_
 CK_POD_NET_RX_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_NET_RX_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
 CK_POD_NET_TX_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_NET_TX_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_NET_TX_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
-CK_POD_DISK_R_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_reads_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
-CK_POD_DISK_R_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_R_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
-CK_POD_DISK_W_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_writes_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
-CK_POD_DISK_W_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_W_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
-CK_POD_DISK_READ_IOPS_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_reads_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
-CK_POD_DISK_READ_IOPS_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_READ_IOPS_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
-CK_POD_DISK_WRITE_IOPS_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_writes_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
-CK_POD_DISK_WRITE_IOPS_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_WRITE_IOPS_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+# CK_POD_DISK_R_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_reads_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
+# CK_POD_DISK_R_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_R_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+# CK_POD_DISK_W_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_writes_bytes_total{namespace="%s"}[%s])) / 1000000' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
+# CK_POD_DISK_W_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_W_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+# CK_POD_DISK_READ_IOPS_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_reads_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
+# CK_POD_DISK_READ_IOPS_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_READ_IOPS_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+# CK_POD_DISK_WRITE_IOPS_AVG_PROMQL=$(printf 'sum by (pod, device) (rate(container_fs_writes_total{namespace="%s"}[%s]))' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
+# CK_POD_DISK_WRITE_IOPS_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_DISK_WRITE_IOPS_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
 CK_POD_THROTTLE_AVG_PROMQL=$(printf 'sum by (pod) (rate(container_cpu_cfs_throttled_seconds_total{namespace="%s", container!="POD", container!=""}[%s])) * 100' "$CK_K8S_NAMESPACE" "$VM_BUCKET_WINDOW")
 CK_POD_THROTTLE_MAX_PROMQL=$(over_time_promql "max_over_time" "$CK_POD_THROTTLE_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
 POD_RANGE_START_TS=$((OLDEST_BUCKET_START + VM_STEP_SECONDS))
@@ -2683,14 +2265,14 @@ vm_fetch_range_prometheus "$CK_POD_NET_RX_AVG_PROMQL" "$POD_RANGE_START_TS" "$PO
 vm_fetch_range_prometheus "$CK_POD_NET_RX_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_net_rx_mbps_max" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_NET_TX_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_net_tx_mbps_avg" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_NET_TX_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_net_tx_mbps_max" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_R_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_mbps_avg" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_R_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_mbps_max" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_W_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_mbps_avg" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_W_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_mbps_max" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_READ_IOPS_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_iops_avg" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_READ_IOPS_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_iops_max" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_WRITE_IOPS_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_iops_avg" "false" "$STATIC_POD_LABELS"
-vm_fetch_range_prometheus "$CK_POD_DISK_WRITE_IOPS_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_iops_max" "false" "$STATIC_POD_LABELS"
+# vm_fetch_range_prometheus "$CK_POD_DISK_R_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_mbps_avg" "false" "$STATIC_POD_LABELS"
+# vm_fetch_range_prometheus "$CK_POD_DISK_R_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_mbps_max" "false" "$STATIC_POD_LABELS"
+# vm_fetch_range_prometheus "$CK_POD_DISK_W_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_mbps_avg" "false" "$STATIC_POD_LABELS"
+# vm_fetch_range_prometheus "$CK_POD_DISK_W_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_mbps_max" "false" "$STATIC_POD_LABELS"
+# vm_fetch_range_prometheus "$CK_POD_DISK_READ_IOPS_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_iops_avg" "false" "$STATIC_POD_LABELS"
+# vm_fetch_range_prometheus "$CK_POD_DISK_READ_IOPS_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_read_iops_max" "false" "$STATIC_POD_LABELS"
+# vm_fetch_range_prometheus "$CK_POD_DISK_WRITE_IOPS_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_iops_avg" "false" "$STATIC_POD_LABELS"
+# vm_fetch_range_prometheus "$CK_POD_DISK_WRITE_IOPS_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod,device" "sr_migration_ck_pod_disk_write_iops_max" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_THROTTLE_AVG_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_cpu_throttle_percent_avg" "false" "$STATIC_POD_LABELS"
 vm_fetch_range_prometheus "$CK_POD_THROTTLE_MAX_PROMQL" "$POD_RANGE_START_TS" "$POD_RANGE_END_TS" "$VM_STEP_SECONDS" "$CK_POD_TIMESERIES_PROM" "pod" "sr_migration_ck_pod_cpu_throttle_percent_max" "false" "$STATIC_POD_LABELS"
 CK_POD_METRICS_END_TS=$(date +%s)
@@ -2791,7 +2373,7 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   CLUSTER_DISK_SELECTOR=$(build_cluster_selector 'fstype!~"tmpfs|overlay"')
   CLUSTER_LOAD_SELECTOR=$(build_cluster_selector "")
   CLUSTER_DISK_IO_SELECTOR=$(build_cluster_selector 'device!~"loop.*|ram.*"')
-  CLUSTER_NET_SELECTOR=$(build_cluster_selector 'device!="lo"')
+  CLUSTER_NET_SELECTOR=$(build_cluster_selector 'device!~"^(lo|cali.*|veth.*|cni.*|flannel.*|tun.*|docker.*|kube.*|virbr.*|br-.*|vxlan.*|genev.*|weave.*|wg.*|tap.*)$"')
   CLUSTER_CPU_BASE=$(printf "sum by (instance) (rate(node_cpu_seconds_total%s[%s])) * 100" "$CLUSTER_CPU_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_MEM_BASE=$(printf "(1 - (node_memory_MemAvailable_bytes%s / node_memory_MemTotal_bytes%s)) * 100" "$CLUSTER_MEM_SELECTOR" "$CLUSTER_MEM_SELECTOR")
   CLUSTER_DISK_BASE=$(printf "(1 - (node_filesystem_avail_bytes%s / node_filesystem_size_bytes%s)) * 100" "$CLUSTER_DISK_SELECTOR" "$CLUSTER_DISK_SELECTOR")
@@ -2806,6 +2388,13 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_READ_AWAIT_BASE=$(printf "(1000 * sum by (instance, device) (rate(node_disk_read_time_seconds_total%s[%s])) / clamp_min(sum by (instance, device) (rate(node_disk_reads_completed_total%s[%s])), 0.001))" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_WRITE_AWAIT_BASE=$(printf "(1000 * sum by (instance, device) (rate(node_disk_write_time_seconds_total%s[%s])) / clamp_min(sum by (instance, device) (rate(node_disk_writes_completed_total%s[%s])), 0.001))" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_IO_UTIL_BASE=$(printf "sum by (instance, device) (rate(node_disk_io_time_seconds_total%s[%s])) * 100" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_DISK_READ_IOPS_BASE=$(printf "sum by (instance, device) (rate(node_disk_reads_completed_total%s[%s]))" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_DISK_WRITE_IOPS_BASE=$(printf "sum by (instance, device) (rate(node_disk_writes_completed_total%s[%s]))" "$CLUSTER_DISK_IO_SELECTOR" "$VM_RATE_WINDOW")
   CLUSTER_NET_RX_BASE=$(printf "(sum by (instance) (rate(node_network_receive_bytes_total%s[%s])) / 1000000)" "$CLUSTER_NET_SELECTOR" "$VM_RATE_WINDOW")
@@ -2834,6 +2423,16 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW" \
     "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_DISK_AWAIT_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_AWAIT_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_READ_AWAIT_AVG_PROMQL=$(printf "(1000 * sum by (instance, device) (rate(node_disk_read_time_seconds_total%s[%s])) / clamp_min(sum by (instance, device) (rate(node_disk_reads_completed_total%s[%s])), 0.001))" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
+  CLUSTER_DISK_READ_AWAIT_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_READ_AWAIT_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_WRITE_AWAIT_AVG_PROMQL=$(printf "(1000 * sum by (instance, device) (rate(node_disk_write_time_seconds_total%s[%s])) / clamp_min(sum by (instance, device) (rate(node_disk_writes_completed_total%s[%s])), 0.001))" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW" \
+    "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
+  CLUSTER_DISK_WRITE_AWAIT_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_WRITE_AWAIT_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
+  CLUSTER_DISK_IO_UTIL_AVG_PROMQL=$(printf "sum by (instance, device) (rate(node_disk_io_time_seconds_total%s[%s])) * 100" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
+  CLUSTER_DISK_IO_UTIL_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_IO_UTIL_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
   CLUSTER_DISK_READ_IOPS_AVG_PROMQL=$(printf "sum by (instance, device) (rate(node_disk_reads_completed_total%s[%s]))" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
   CLUSTER_DISK_READ_IOPS_MAX_PROMQL=$(over_time_promql "max_over_time" "$CLUSTER_DISK_READ_IOPS_BASE" "$VM_BUCKET_WINDOW" "$VM_RATE_WINDOW")
   CLUSTER_DISK_WRITE_IOPS_AVG_PROMQL=$(printf "sum by (instance, device) (rate(node_disk_writes_completed_total%s[%s]))" "$CLUSTER_DISK_IO_SELECTOR" "$VM_BUCKET_WINDOW")
@@ -2869,8 +2468,12 @@ if [[ -n "$VM_NODE_SELECTOR" || -n "$CLUSTER_INSTANCE_SELECTOR" ]]; then
   vm_fetch_range_prometheus "$CLUSTER_DISK_READ_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_read_mbps_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_write_mbps_avg" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_write_mbps_max" "true" "$STATIC_NODE_LABELS"
-  vm_fetch_range_prometheus "$CLUSTER_DISK_AWAIT_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_await_ms_avg" "true" "$STATIC_NODE_LABELS"
-  vm_fetch_range_prometheus "$CLUSTER_DISK_AWAIT_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_await_ms_max" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_IO_UTIL_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_io_util_percent_avg" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_IO_UTIL_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_io_util_percent_max" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_READ_AWAIT_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_read_await_ms_avg" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_READ_AWAIT_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_read_await_ms_max" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_AWAIT_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_write_await_ms_avg" "true" "$STATIC_NODE_LABELS"
+  vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_AWAIT_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_write_await_ms_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_DISK_READ_IOPS_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_read_iops_avg" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_DISK_READ_IOPS_MAX_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_read_iops_max" "true" "$STATIC_NODE_LABELS"
   vm_fetch_range_prometheus "$CLUSTER_DISK_WRITE_IOPS_AVG_PROMQL" "$NODE_RANGE_START_TS" "$NODE_RANGE_END_TS" "$VM_STEP_SECONDS" "$NODE_CLUSTER_TIMESERIES_PROM" "instance,device" "sr_migration_cluster_node_disk_write_iops_avg" "true" "$STATIC_NODE_LABELS"
@@ -2960,9 +2563,7 @@ TRAFFIC_JSON=$(cat <<EOF
   "query_log_latency_timeseries_by_user_group_csv": $(json_string "$QUERY_LOG_LATENCY_BY_USER_GROUP_CSV"),
   "slow_queries_csv": $(json_string "$SLOW_QUERIES_CSV"),
   "slow_queries_by_user_group_csv": $(json_string "$SLOW_QUERIES_BY_USER_GROUP_CSV"),
-  "query_time_range_distribution_by_user_group_csv": $(json_string "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV"),
-  "query_time_range_distribution_strict_csv": $(json_string "$QUERY_TIME_RANGE_STRICT_CSV"),
-  "query_time_range_distribution_strict_by_user_group_csv": $(json_string "$QUERY_TIME_RANGE_STRICT_BY_USER_GROUP_CSV")
+  "query_time_range_distribution_by_user_group_csv": $(json_string "$QUERY_TIME_RANGE_BY_USER_GROUP_CSV")
 }
 EOF
 )

@@ -4,6 +4,7 @@ import re
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
+from xml.sax.saxutils import escape
 
 input_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./migration_report")
 pdf_path = input_dir / "report.pdf"
@@ -149,9 +150,9 @@ top10_rows = [
     for r in top10
 ]
 
-time_range = read_csv(input_dir / "timeseries/query_time_range_distribution_strict_by_user_group.csv")
+time_range = read_csv(input_dir / "timeseries/query_time_range_distribution_by_user_group.csv")
 non_human = [r for r in time_range if r["user_group"] == "__NON_HUMAN__"]
-non_human_sorted = sorted(non_human, key=lambda r: float(r.get("p99_days") or 0), reverse=True)[:10]
+non_human_sorted = sorted(non_human, key=lambda r: float(r.get("p100_days") or 0), reverse=True)[:10]
 time_rows = [
     [
         r.get("table_name", r.get("table", "")),
@@ -171,11 +172,14 @@ views_rows = [[r["database"], r["view"], r["engine"], r["create_table_query_one_
 
 plot_mode = "matplotlib"
 plt = None
+font_prop = None
 try:
     import matplotlib
     import matplotlib.pyplot as plt
+    import matplotlib.font_manager as font_manager
     matplotlib.rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "STHeiti", "Arial Unicode MS", "SimHei"]
     matplotlib.rcParams["axes.unicode_minus"] = False
+    font_prop = font_manager.FontProperties(family=["Arial Unicode MS", "PingFang SC", "Heiti SC", "STHeiti", "SimHei"])
 except Exception as e:
     sys.stderr.write("ERROR: 绘图依赖未就绪，请安装 matplotlib。\n")
     sys.stderr.write("ERROR: {}\n".format(e))
@@ -242,6 +246,17 @@ def series_max(points):
         return ""
     return format_number(max(p[1] for p in points))
 
+def format_avg_max(avg_points, max_points):
+    avg_value = series_avg(avg_points)
+    max_value = series_max(max_points)
+    if avg_value == "" and max_value == "":
+        return ""
+    if avg_value == "":
+        return max_value
+    if max_value == "":
+        return avg_value
+    return "{} / {}".format(avg_value, max_value)
+
 def series_latest(points):
     if not points:
         return None
@@ -299,14 +314,6 @@ def metric_desc(mname, y_label):
         "sr_migration_ck_pod_net_rx_mbps_max": "说明：CK Pod网络接收速率峰值（MB/s），用于识别入站突发流量。",
         "sr_migration_ck_pod_net_tx_mbps_avg": "说明：CK Pod网络发送速率平均值（MB/s），反映出站带宽使用。",
         "sr_migration_ck_pod_net_tx_mbps_max": "说明：CK Pod网络发送速率峰值（MB/s），用于识别出站突发流量。",
-        "sr_migration_ck_pod_disk_read_mbps_avg": "说明：CK Pod按device统计的磁盘读速率平均值（MB/s），反映磁盘读吞吐。",
-        "sr_migration_ck_pod_disk_read_mbps_max": "说明：CK Pod按device统计的磁盘读速率峰值（MB/s），用于识别读突发。",
-        "sr_migration_ck_pod_disk_write_mbps_avg": "说明：CK Pod按device统计的磁盘写速率平均值（MB/s），反映磁盘写吞吐。",
-        "sr_migration_ck_pod_disk_write_mbps_max": "说明：CK Pod按device统计的磁盘写速率峰值（MB/s），用于识别写突发。",
-        "sr_migration_ck_pod_disk_read_iops_avg": "说明：CK Pod按device统计的磁盘读IOPS平均值，用于观察读请求压力。",
-        "sr_migration_ck_pod_disk_read_iops_max": "说明：CK Pod按device统计的磁盘读IOPS峰值，用于识别读突发。",
-        "sr_migration_ck_pod_disk_write_iops_avg": "说明：CK Pod按device统计的磁盘写IOPS平均值，用于观察写请求压力。",
-        "sr_migration_ck_pod_disk_write_iops_max": "说明：CK Pod按device统计的磁盘写IOPS峰值，用于识别写突发。",
         "sr_migration_clickhouse_metrics_merges_avg": "说明：ClickHouse后台合并任务数平均值，用于观察合并压力。",
         "sr_migration_clickhouse_metrics_merges_max": "说明：ClickHouse后台合并任务数峰值，用于识别合并高峰。",
         "sr_migration_clickhouse_metrics_parts_active_avg": "说明：活跃Part数量平均值，用于评估存储碎片情况。",
@@ -343,8 +350,12 @@ def metric_desc(mname, y_label):
         "sr_migration_cluster_node_disk_read_mbps_max": "说明：节点按device统计的磁盘读吞吐峰值（MB/s），用于识别读突发。",
         "sr_migration_cluster_node_disk_write_mbps_avg": "说明：节点按device统计的磁盘写吞吐平均值（MB/s），反映写IO压力。",
         "sr_migration_cluster_node_disk_write_mbps_max": "说明：节点按device统计的磁盘写吞吐峰值（MB/s），用于识别写突发。",
-        "sr_migration_cluster_node_disk_await_ms_avg": "说明：节点按device统计的磁盘IO等待时延平均值（ms），反映IO响应情况。",
-        "sr_migration_cluster_node_disk_await_ms_max": "说明：节点按device统计的磁盘IO等待时延峰值（ms），用于识别IO抖动。",
+        "sr_migration_cluster_node_disk_io_util_percent_avg": "说明：节点按device统计的磁盘IO利用率平均值（%），反映磁盘忙碌程度。",
+        "sr_migration_cluster_node_disk_io_util_percent_max": "说明：节点按device统计的磁盘IO利用率峰值（%），用于识别IO高峰。",
+        "sr_migration_cluster_node_disk_read_await_ms_avg": "说明：节点按device统计的磁盘读IO等待时延平均值（ms），用于分析读延迟。",
+        "sr_migration_cluster_node_disk_read_await_ms_max": "说明：节点按device统计的磁盘读IO等待时延峰值（ms），用于识别读抖动。",
+        "sr_migration_cluster_node_disk_write_await_ms_avg": "说明：节点按device统计的磁盘写IO等待时延平均值（ms），用于分析写延迟。",
+        "sr_migration_cluster_node_disk_write_await_ms_max": "说明：节点按device统计的磁盘写IO等待时延峰值（ms），用于识别写抖动。",
         "sr_migration_cluster_node_disk_read_iops_avg": "说明：节点按device统计的磁盘读IOPS平均值，用于观察读请求压力。",
         "sr_migration_cluster_node_disk_read_iops_max": "说明：节点按device统计的磁盘读IOPS峰值，用于识别读突发。",
         "sr_migration_cluster_node_disk_write_iops_avg": "说明：节点按device统计的磁盘写IOPS平均值，用于观察写请求压力。",
@@ -453,39 +464,49 @@ for r in k8s_nodes:
     ])
     device, total_latest = pick_filesystem_device(filesystem_total_series, node_ip)
     # todo 增加device的debug日志
-    sys.stderr.write("device issssss {}".format(device))
     free_points = get_series_points(filesystem_metrics, "sr_migration_cluster_filesystem_free_bytes", node_ip, device)
     free_latest = series_latest(free_points)
     free_percent = ""
     if free_latest is not None and total_latest not in (None, 0):
         free_percent = format_number((free_latest / total_latest) * 100.0)
     mapped_device = map_device(device)
-    disk_await_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_await_ms_max", node_ip, mapped_device)
-    disk_await_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_await_ms_avg", node_ip, mapped_device)
+    disk_io_util_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_io_util_percent_max", node_ip, mapped_device)
+    disk_io_util_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_io_util_percent_avg", node_ip, mapped_device)
+    disk_read_await_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_await_ms_max", node_ip, mapped_device)
+    disk_read_await_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_await_ms_avg", node_ip, mapped_device)
+    disk_write_await_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_await_ms_max", node_ip, mapped_device)
+    disk_write_await_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_await_ms_avg", node_ip, mapped_device)
     disk_read_mbps_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_mbps_avg", node_ip, mapped_device)
     disk_read_mbps_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_mbps_max", node_ip, mapped_device)
+    disk_write_mbps_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_mbps_avg", node_ip, mapped_device)
+    disk_write_mbps_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_mbps_max", node_ip, mapped_device)
     disk_read_iops_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_iops_avg", node_ip, mapped_device)
     disk_read_iops_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_read_iops_max", node_ip, mapped_device)
     disk_write_iops_avg_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_iops_avg", node_ip, mapped_device)
     disk_write_iops_max_points = get_series_points(node_usage_metrics, "sr_migration_cluster_node_disk_write_iops_max", node_ip, mapped_device)
     disk_values = [
-        series_max(disk_await_max_points),
-        series_avg(disk_await_avg_points),
-        series_avg(disk_read_mbps_avg_points),
-        series_max(disk_read_mbps_max_points),
-        series_avg(disk_read_iops_avg_points),
-        series_max(disk_read_iops_max_points),
-        series_avg(disk_write_iops_avg_points),
-        series_max(disk_write_iops_max_points),
+        format_avg_max(disk_io_util_avg_points, disk_io_util_max_points),
+        format_avg_max(disk_read_await_avg_points, disk_read_await_max_points),
+        format_avg_max(disk_write_await_avg_points, disk_write_await_max_points),
+        format_avg_max(disk_read_mbps_avg_points, disk_read_mbps_max_points),
+        format_avg_max(disk_write_mbps_avg_points, disk_write_mbps_max_points),
+        format_avg_max(disk_read_iops_avg_points, disk_read_iops_max_points),
+        format_avg_max(disk_write_iops_avg_points, disk_write_iops_max_points),
     ]
     if all(v == "" for v in disk_values):
         keys = sorted(node_usage_metrics.keys())
         sys.stderr.write("DEBUG: storage metrics empty for node_ip={} device={} metrics_count={}\n".format(node_ip, device or "", len(keys)))
         for metric_name in (
-            "sr_migration_cluster_node_disk_await_ms_avg",
-            "sr_migration_cluster_node_disk_await_ms_max",
+            "sr_migration_cluster_node_disk_io_util_percent_avg",
+            "sr_migration_cluster_node_disk_io_util_percent_max",
+            "sr_migration_cluster_node_disk_read_await_ms_avg",
+            "sr_migration_cluster_node_disk_read_await_ms_max",
+            "sr_migration_cluster_node_disk_write_await_ms_avg",
+            "sr_migration_cluster_node_disk_write_await_ms_max",
             "sr_migration_cluster_node_disk_read_mbps_avg",
             "sr_migration_cluster_node_disk_read_mbps_max",
+            "sr_migration_cluster_node_disk_write_mbps_avg",
+            "sr_migration_cluster_node_disk_write_mbps_max",
             "sr_migration_cluster_node_disk_read_iops_avg",
             "sr_migration_cluster_node_disk_read_iops_max",
             "sr_migration_cluster_node_disk_write_iops_avg",
@@ -506,7 +527,6 @@ for r in k8s_nodes:
         disk_values[4],
         disk_values[5],
         disk_values[6],
-        disk_values[7],
     ])
     net_summary_rows.append([
         node_ip,
@@ -535,11 +555,21 @@ for pf in prom_files:
         section["desc"] = "说明：展示CK Pod级别的资源使用情况与波动。"
     elif cat == "业务表写入":
         section["desc"] = "说明：展示业务表写入量随时间的变化趋势。"
+    selected_raw_device = {}
+    selected_mapped_device = {}
+    for r in k8s_nodes:
+        ip = get_value(r, "internal_ip")
+        dev, _ = pick_filesystem_device(filesystem_total_series, ip)
+        if dev:
+            selected_raw_device[ip] = dev
+            selected_mapped_device[ip] = map_device(dev)
     for mname, series_map in metrics.items():
         name_lower = mname.lower()
         if "swap_usage" in name_lower:
             continue
         if name_lower.startswith("sr_migration_clickhouse_metrics_") and "connections" in name_lower and "tcp_connections" not in name_lower:
+            continue
+        if name_lower in ("sr_migration_cluster_node_disk_await_ms_avg", "sr_migration_cluster_node_disk_await_ms_max"):
             continue
         name_lower = mname.lower()
         y_label = "值"
@@ -549,6 +579,22 @@ for pf in prom_files:
                 scaled_map[sk] = [(x, y / (1024.0 ** 3)) for x, y in points]
             series_map = scaled_map
             y_label = "值(GB)"
+        filtered_map = {}
+        if "disk_usage_percent" in name_lower and "cluster_node" in name_lower:
+            for sk, points in series_map.items():
+                inst, dev = parse_instance_device(sk)
+                if inst and (inst in selected_raw_device):
+                    if dev is None or dev == "" or dev == selected_raw_device.get(inst):
+                        filtered_map[sk] = points
+        elif any(k in name_lower for k in ["disk_read_mbps", "disk_write_mbps", "disk_read_iops", "disk_write_iops", "disk_read_await_ms", "disk_write_await_ms", "disk_io_util_percent"]):
+            for sk, points in series_map.items():
+                inst, dev = parse_instance_device(sk)
+                target = selected_mapped_device.get(inst)
+                if inst and dev and target and dev == target:
+                    filtered_map[sk] = points
+        else:
+            filtered_map = series_map
+        series_map = filtered_map
         is_business_writes = cat == "业务表写入"
         if is_business_writes:
             latest_times = [points[-1][0] for points in series_map.values() if points]
@@ -564,20 +610,15 @@ for pf in prom_files:
             return points[-1][1] if points else float("-inf")
         sorted_series = sorted(series_map.items(), key=lambda kv: last_value(kv[1]), reverse=True)[:10]
         plt.figure(figsize=(10, 5))
+        ax = plt.gca()
         try:
             import matplotlib.dates as mdates
-            ax = plt.gca()
-            if is_business_writes:
-                locator = mdates.HourLocator(interval=1)
-                formatter = mdates.DateFormatter("%m-%d %H:00")
-            else:
-                locator = mdates.AutoDateLocator()
-                formatter = mdates.ConciseDateFormatter(locator)
+            locator = mdates.HourLocator(interval=3)
+            formatter = mdates.DateFormatter("%m-%d %H:00")
             ax.xaxis.set_major_locator(locator)
             ax.xaxis.set_major_formatter(formatter)
-            ax.tick_params(axis="x", labelsize=8)
-            if is_business_writes:
-                plt.setp(ax.get_xticklabels(), rotation=90, ha="center", va="center")
+            ax.tick_params(axis="x", labelsize=6)
+            plt.setp(ax.get_xticklabels(), rotation=90, ha="center", va="center")
         except Exception:
             pass
         for sk, points in sorted_series:
@@ -585,9 +626,16 @@ for pf in prom_files:
             ys = [p[1] for p in points]
             if xs and ys:
                 plt.plot(xs, ys, label=sk)
-        plt.title("{} ({})".format(mname, pf.name))
-        plt.xlabel("时间")
-        plt.ylabel(y_label)
+        if font_prop:
+            plt.title("{} ({})".format(mname, pf.name), fontproperties=font_prop)
+            plt.xlabel("时间", fontproperties=font_prop)
+            plt.ylabel(y_label, fontproperties=font_prop)
+            for label in ax.get_yticklabels():
+                label.set_fontproperties(font_prop)
+        else:
+            plt.title("{} ({})".format(mname, pf.name))
+            plt.xlabel("时间")
+            plt.ylabel(y_label)
         plt.legend(loc="best", fontsize=8)
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
@@ -684,7 +732,7 @@ def add_heading1(text):
     flow.append(Paragraph(text, style_h1))
     flow.append(Spacer(1, 10))
 
-def add_table(table_rows):
+def add_table(table_rows, wrap_header=False, wrap_cols=None):
     if not table_rows:
         return
     max_width = A4[0] - 72
@@ -719,11 +767,19 @@ def add_table(table_rows):
             target_font_size = base_font_size
     except Exception:
         target_font_size = base_font_size
+    if wrap_cols is None:
+        wrap_cols = []
+    wrap_style = style_table.clone("TableWrap")
+    wrap_style.wordWrap = "CJK"
     table_cells = []
     for r_idx, row in enumerate(table_rows):
         row_cells = []
         for i, cell in enumerate(row):
-            row_cells.append(str(cell))
+            text = str(cell)
+            if (wrap_header and r_idx == 0) or (i in wrap_cols and r_idx > 0):
+                row_cells.append(Paragraph(escape(text).replace("\n", "<br/>"), wrap_style))
+            else:
+                row_cells.append(text)
         table_cells.append(row_cells)
     table = Table(table_cells, colWidths=col_widths, repeatRows=1)
     table.setStyle(TableStyle([
@@ -793,8 +849,8 @@ add_table([
 
 add_heading("存储概要")
 add_table([
-    ["节点IP", "文件系统总容量(GB)", "文件系统可用容量(GB)", "可用容量占比(%)", "磁盘await最大(ms)", "磁盘await均值(ms)", "磁盘读吞吐均值(MB/s)", "磁盘读吞吐最大(MB/s)", "磁盘读IOPS均值", "磁盘读IOPS最大", "磁盘写IOPS均值", "磁盘写IOPS最大"]
- ] + storage_summary_rows)
+    ["节点IP", "文件系统总容量(GB)", "文件系统可用容量(GB)", "可用容量占比(%)", "磁盘IO利用率(均值/最大,%)", "磁盘读时延(均值/最大,ms)", "磁盘写时延(均值/最大,ms)", "磁盘读吞吐(均值/最大,MB/s)", "磁盘写吞吐(均值/最大,MB/s)", "磁盘读IOPS(均值/最大,IOPS)", "磁盘写IOPS(均值/最大,IOPS)"]
+ ] + storage_summary_rows, wrap_header=True)
 
 add_heading("网口概要")
 add_table([
@@ -828,7 +884,7 @@ add_heading("非business库表列表")
 add_table([["database", "table"]] + non_business)
 
 add_heading("视图DDL")
-add_table([["database", "view", "engine", "create_table_query_one_line"]] + views_rows)
+add_table([["database", "view", "engine", "create_table_query_one_line"]] + views_rows, wrap_header=True, wrap_cols=[3])
 
 add_heading1("时序图")
 for section in timeseries_sections:
