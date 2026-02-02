@@ -4,7 +4,7 @@
 
 ## 默认使用
 
-将collect.sh和business_time_config.yaml放置任意目录后执行以下命令即可：
+将collect.sh和business_time_config.yaml放至同一目录后执行以下命令，等待510分钟运行结束后，在同一目录下得到文件：migration_report.tar.gz
 
 ```bash
 chmod +x ./collect.sh && ./collect.sh # 默认输出到 ./migration_report.tar.gz
