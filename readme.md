@@ -4,8 +4,10 @@
 
 ## 默认使用
 
+将collect.sh和business_time_config.yaml放置任意目录后执行以下命令即可：
+
 ```bash
-./collect.sh # 默认输出到 ./migration_report.tar.gz
+chmod +x ./collect.sh && ./collect.sh # 默认输出到 ./migration_report.tar.gz
 ```
 
 ## 可选参数
@@ -43,7 +45,6 @@ Optional options:
 Environment variables listed in the options above act as defaults for the options above.
 The script prints the aggregated JSON payload to stdout once all collectors finish.
 ```
-
 
 压力风险说明（粗略）：
 
