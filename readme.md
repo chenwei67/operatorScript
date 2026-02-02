@@ -4,7 +4,7 @@
 
 ## 默认使用
 
-将collect.sh和business_time_config.yaml放至同一目录后执行以下命令，等待510分钟运行结束后，在同一目录下得到文件：migration_report.tar.gz
+将collect.sh和business_time_config.yaml放至同一目录后执行以下命令，等待脚本运行结束后，在同一目录下得到文件：migration_report.tar.gz
 
 ```bash
 chmod +x ./collect.sh && ./collect.sh # 默认输出到 ./migration_report.tar.gz
@@ -33,8 +33,8 @@ Optional options:
   --vm-namespace NAME                Namespace where VictoriaMetrics runs (default "monitor-platform" or VM_NAMESPACE)
   --vm-port PORT                     VMSelect port (default 8481 or VM_PORT)
   --vm-tenant-id ID                  VictoriaMetrics tenant/account ID (default 0 or VM_TENANT_ID)
-  --vm-bucket-interval-minutes MINS  VM downsample bucket size (default 60 or VM_BUCKET_INTERVAL_MINUTES)
-  --vm-rate-window DURATION          PromQL rate() window (default 5m or VM_RATE_WINDOW)
+  --vm-bucket-interval-minutes MINS  VM downsample bucket size (default 2 or VM_BUCKET_INTERVAL_MINUTES)
+  --vm-rate-window DURATION          PromQL rate() window (default 2m or VM_RATE_WINDOW)
   --vm-node-selector SELECTOR        Selector snippet injected into node-level PromQL
   --vm-ck-pod-selector SELECTOR      Selector snippet injected into CK pod PromQL
   --chi-name NAME                    ClickHouseInstallation name (default "pro" or CHI_NAME)
@@ -58,6 +58,7 @@ The script prints the aggregated JSON payload to stdout once all collectors fini
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- | ------------------- | ------------------------------ | ---------------------------------------------------------- |
 | 汇总 JSON（总入口） | 汇总各类 CSV/Prom 路径与摘要信息（cluster_overview/tables/schemas/traffic/resources/meta）                                            | `migration_metrics.json`                    | 低                  | 元信息（聚合索引）             | 统一入口，便于自动化解析与归档，作为迁移评估报告的数据索引 |
 | 归档压缩包（可选）  | `tar -czf "${OUTPUT_DIR}.tar.gz"`，成功后删除原目录                                    | `${OUTPUT_DIR}.tar.gz`（与输出目录同级） | 低                                            | 文件打包（不查 CK） | 便于跨环境传输、留档与离线分析 |                                                            |
+| 导出数据校验报告    | 对输出目录内文件做空文件/无数据校验，并输出 Prom 指标样本统计                                                                         | `export_data_validation_report.txt` / `prom_metrics_status.tsv` | 低 | 本地文件扫描 | 快速识别无数据或空文件，减少人工逐项核对 |
 
 ## 二、集群规模与硬件信息
 
@@ -72,7 +73,8 @@ The script prints the aggregated JSON payload to stdout once all collectors fini
 | 集群节点数                                    | `kubectl get nodes --no-headers \| wc -l`                                                                                                                                                                                                       | `migration_metrics.json.cluster_overview.cluster_node_count`                                                      | 低                      | 元信息（K8s API）        |
 | CHI 分片/副本与期望节点数                     | 从 `kubectl get chi ... jsonpath` 取 `shardsCount/replicasCount`，并计算 `shards*replicas`                                                                                                                                                 | `migration_metrics.json.cluster_overview.chi_shards_count` / `chi_replicas_count` / `chi_expected_node_count` | 低                      | 元信息（CRD 配置）       |
 | K8s 节点硬件清单（核数/内存）                 | `kubectl get nodes -o jsonpath ...` 导出 `cpu_capacity/memory_capacity` 及 allocatable                                                                                                                                                       | `snapshots/cluster_k8s_nodes.csv`                                                                                 | 低                      | 元信息（多节点清单）     |
-| K8s 节点磁盘容量与使用量（来自 VM）           | VictoriaMetrics `api/v1/query` 拉 `node_filesystem_size_bytes/free_bytes`，按 node+mountpoint 计算 `used_bytes/used_percent`（过滤 tmpfs/overlay 等）                                                                                      | `snapshots/cluster_node_disk_usage.csv`                                                                           | 低（对 CK）/中（对 VM） | 时序聚合（多点度量）     |
+| 集群存储卷信息（system.disks）               | `clusterAllReplicas(system.disks)` 拉取各节点磁盘路径、总量、剩余等                                                                                                                                                | `snapshots/cluster_storage_volumes.csv`                                                                           | 低                      | 系统表多行               |
+| /dev/mapper 设备映射                         | 读取 `/dev/mapper` 软链接关系                                                                                                                                                                           | `snapshots/device_mapper.csv`                                                                                    | 低                      | 本地文件系统            |
 | 执行节点硬件快照（CPU 核数/内存/磁盘/负载等） | 从 `/proc/meminfo`、`/proc/loadavg`、`/proc/cpuinfo`、`df`、`/proc/sys/fs/file-nr`、`/proc/net/sockstat` 采集：`cpu_cores/memory_total_bytes/memory_used_bytes/disk_total_bytes/disk_used_bytes/load_avg/cpu_flags/swap/fd/tcp` 等 | `migration_metrics.json.resources.node_level.*`                                                                   | 低                      | 本机元信息（单节点快照） |
 
 ## 三、部署与配置（可复现性/对齐）
@@ -95,6 +97,10 @@ The script prints the aggregated JSON payload to stdout once all collectors fini
 | 全量表统计（行数/压缩/解压大小） | `clusterAllReplicas(system.tables)` 取表清单；LEFT JOIN `clusterAllReplicas(system.parts)`（限定 replica_num=1）聚合 `sum(rows/bytes_on_disk/data_uncompressed_bytes)` | `table_stats.csv`                           | 中       | 系统表聚合（多表多行）   |
 | 全量表 schema（列级）            | `system.columns` 导出 `database/table/column/type/default_*`                                                                                                             | `table_schema.csv`                          | 低-中    | 系统表扫描（多表多列）   |
 | business 表 TTL 元数据           | 从 `system.tables.engine_full` 提取 TTL 表达式与 TTL 数值                                                                                                                  | `business_ttl.csv`                          | 低       | 系统表解析（元信息多行） |
+| 视图/物化视图 DDL（单行）        | `system.tables.create_table_query` 中抽取 view/materialized view DDL 并做换行折叠                                                                                          | `views_ddl.csv`                             | 低       | 系统表扫描（视图元信息） |
+| Parts/Partitions 快照            | `system.parts` 统计 active parts/分区数/行数/磁盘大小                                                                                                                       | `snapshots/cluster_parts_snapshot.csv`      | 低-中    | 系统表聚合（多表多行）   |
+| Merges 快照                      | `system.merges` 统计各节点合并任务数量与体量                                                                                                                                 | `snapshots/cluster_merges_snapshot.csv`     | 低       | 系统表快照              |
+| Mutations 快照                   | `system.mutations` 统计未完成 mutation 数量                                                                                                                                  | `snapshots/cluster_mutations_snapshot.csv`  | 低       | 系统表快照              |
 
 ## 五、流量与查询画像
 
@@ -112,10 +118,8 @@ The script prints the aggregated JSON payload to stdout once all collectors fini
 | query_log 延迟画像（root/非 root 聚合）       | 在上述延迟画像基础上，将 `user` 聚合为 `root` 与 `non_root` 两组（保留原不聚合版本）                                                                                                                         | `timeseries/query_log_latency_timeseries_by_user_group.csv`                                                              | 高                      | 系统日志表扫描（按用户聚合）           |
 | Top 慢查询（按 normalized_query 聚合）        | `GROUP BY normalized_query` 聚合 `count/p95/avg/sum(read_bytes)/max(memory_usage)`，按 p95 降序取 TopN                                                                                                         | `timeseries/slow_queries_top.csv`                                                                                        | 高                      | 系统日志表扫描（TopN 聚合）            |
 | Top 慢查询（root/非 root 聚合）               | 在 Top 慢查询基础上，将 `user` 聚合为 `root` 与 `non_root` 两组（保留原不聚合版本）                                                                                                                          | `timeseries/slow_queries_top_by_user_group.csv`                                                                          | 高                      | 系统日志表扫描（TopN+按用户聚合）      |
-| 查询时间范围分布（按表，启发式正则解析 SQL）  | 扫 `system.query_log`，对 `ql.query` 做多类正则解析估算范围天数，按表统计比例与分位；带 `SETTINGS max_threads/max_execution_time`                                                                            | `timeseries/query_time_range_distribution.csv`                                                                           | 高                      | 系统日志表扫描（正则解析 SQL，启发式） |
-| 查询时间范围分布（root/非 root 聚合，启发式） | 在启发式查询时间范围分布基础上，将 `user` 聚合为 `root` 与 `non_root` 两组（保留原不聚合版本）                                                                                                               | `query_time_range_distribution_by_user_group.csv`                                                                        | 高                      | 系统日志表扫描（正则+按用户聚合）      |
-| 查询时间范围分布（按表，严格版）              | 仅基于配置时间列上的显式边界（时间戳/日期）估算范围天数，忽略与时间列无关的日期/INTERVAL，按表统计比例与分位                                                                                                       | `timeseries/query_time_range_distribution_strict.csv`                                                                    | 高                      | 系统日志表扫描（严格解析，命中较少）   |
-| 查询时间范围分布（root/非 root，严格版）      | 严格版查询时间范围分布基础上，将 `user` 聚合为 `root` 与 `non_root` 两组                                                                                                                                     | `query_time_range_distribution_strict_by_user_group.csv`                                                                 | 高                      | 系统日志表扫描（严格+按用户聚合）      |
+| 查询时间范围分布（按表+用户组，启发式）       | 扫 `system.query_log`，对 `ql.query` 做多类正则解析估算范围天数，按表+用户组统计比例与分位；带 `SETTINGS max_threads/max_execution_time`                                                                       | `timeseries/query_time_range_distribution_by_user_group.csv`                                                            | 高                      | 系统日志表扫描（正则解析 SQL，启发式） |
+| 查询时间范围解析明细（debug）                 | 输出匹配/未匹配的原始查询语句样本（仅当 `--debug true` 时生成）                                                                                                             | `timeseries/query_time_range_statements/`（按表拆分 `*.matched.log` / `*.unmatched.log`）                                 | 高                      | 系统日志表扫描（调试输出）              |
 
 ## 六、资源监控（来自 VictoriaMetrics）
 
