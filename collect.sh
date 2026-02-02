@@ -25,8 +25,8 @@ Optional options:
   --vm-namespace NAME                Namespace where VictoriaMetrics runs (default "monitor-platform" or VM_NAMESPACE)
   --vm-port PORT                     VMSelect port (default 8481 or VM_PORT)
   --vm-tenant-id ID                  VictoriaMetrics tenant/account ID (default 0 or VM_TENANT_ID)
-  --vm-bucket-interval-minutes MINS  VM downsample bucket size (default 3 or VM_BUCKET_INTERVAL_MINUTES)
-  --vm-rate-window DURATION          PromQL rate() window (default 3m or VM_RATE_WINDOW)
+  --vm-bucket-interval-minutes MINS  VM downsample bucket size (default 2 or VM_BUCKET_INTERVAL_MINUTES)
+  --vm-rate-window DURATION          PromQL rate() window (default 2m or VM_RATE_WINDOW)
   --vm-node-selector SELECTOR        Selector snippet injected into node-level PromQL
   --vm-ck-pod-selector SELECTOR      Selector snippet injected into CK pod PromQL
   --chi-name NAME                    ClickHouseInstallation name (default "pro" or CHI_NAME)
@@ -149,8 +149,8 @@ VM_SERVICE="${VM_SERVICE:-vmselect-vmcluster}"
 VM_NAMESPACE="${VM_NAMESPACE:-monitor-platform}"
 VM_PORT="${VM_PORT:-8481}"
 VM_TENANT_ID="${VM_TENANT_ID:-0}"
-VM_BUCKET_INTERVAL_MINUTES="${VM_BUCKET_INTERVAL_MINUTES:-3}"
-VM_RATE_WINDOW="${VM_RATE_WINDOW:-3m}"
+VM_BUCKET_INTERVAL_MINUTES="${VM_BUCKET_INTERVAL_MINUTES:-2}"
+VM_RATE_WINDOW="${VM_RATE_WINDOW:-2m}"
 VM_NODE_SELECTOR="${VM_NODE_SELECTOR:-}"
 VM_CK_POD_SELECTOR="${VM_CK_POD_SELECTOR:-}"
 CK_HELM_NAMESPACE="${CK_HELM_NAMESPACE:-ck}"
@@ -386,7 +386,7 @@ VM_BUCKET_INTERVAL_MINUTES=$((VM_BUCKET_INTERVAL_MINUTES))
 (( QUERY_TIME_RANGE_DAYS <= 0 )) && QUERY_TIME_RANGE_DAYS=30
 (( QUERY_TIME_RANGE_MAX_THREADS <= 0 )) && QUERY_TIME_RANGE_MAX_THREADS=2
 (( QUERY_TIME_RANGE_MAX_SECONDS <= 0 )) && QUERY_TIME_RANGE_MAX_SECONDS=300
-(( VM_BUCKET_INTERVAL_MINUTES <= 0 )) && VM_BUCKET_INTERVAL_MINUTES=3
+(( VM_BUCKET_INTERVAL_MINUTES <= 0 )) && VM_BUCKET_INTERVAL_MINUTES=2
 RESOURCE_HISTORY_MINUTES=$((RESOURCE_HISTORY_DAYS * 24 * 60))
 if (( RESOURCE_HISTORY_MINUTES < BUCKET_INTERVAL_MINUTES )); then
   RESOURCE_HISTORY_MINUTES=$BUCKET_INTERVAL_MINUTES
@@ -2182,7 +2182,7 @@ log_collector_stats "business_table_writes" "$BUSINESS_WRITES_PROM" "$BUSINESS_W
 
 VM_STEP_SECONDS=$((VM_BUCKET_INTERVAL_MINUTES * 60))
 if (( VM_STEP_SECONDS <= 0 )); then
-  VM_STEP_SECONDS=180
+  VM_STEP_SECONDS=120
 fi
 VM_RESOURCE_BUCKET_COUNT=$((RESOURCE_HISTORY_MINUTES / VM_BUCKET_INTERVAL_MINUTES))
 if (( RESOURCE_HISTORY_MINUTES % VM_BUCKET_INTERVAL_MINUTES != 0 )); then

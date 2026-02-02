@@ -177,9 +177,14 @@ try:
     import matplotlib
     import matplotlib.pyplot as plt
     import matplotlib.font_manager as font_manager
-    matplotlib.rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "STHeiti", "Arial Unicode MS", "SimHei"]
+    available_fonts = {f.name for f in font_manager.fontManager.ttflist}
+    preferred_fonts = ["PingFang SC", "Heiti SC", "STHeiti", "Arial Unicode MS", "SimHei", "DejaVu Sans"]
+    selected_fonts = [f for f in preferred_fonts if f in available_fonts]
+    if not selected_fonts:
+        selected_fonts = ["DejaVu Sans"]
+    matplotlib.rcParams["font.sans-serif"] = selected_fonts
     matplotlib.rcParams["axes.unicode_minus"] = False
-    font_prop = font_manager.FontProperties(family=["Arial Unicode MS", "PingFang SC", "Heiti SC", "STHeiti", "SimHei"])
+    font_prop = font_manager.FontProperties(family=selected_fonts)
 except Exception as e:
     sys.stderr.write("ERROR: 绘图依赖未就绪，请安装 matplotlib。\n")
     sys.stderr.write("ERROR: {}\n".format(e))
