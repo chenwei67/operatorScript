@@ -1974,6 +1974,27 @@ read -r LOAD_1 LOAD_5 LOAD_15 _ < /proc/loadavg 2>/dev/null || {
 }
 CPU_FLAGS=$(grep -ow 'avx2' /proc/cpuinfo 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,/, /g; s/^, //; s/, $//' )
 [[ -z "$CPU_FLAGS" ]] && CPU_FLAGS="none"
+VIRT_TYPE=""
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+  VIRT_TYPE=$(systemd-detect-virt 2>/dev/null || true)
+  if [[ -z "$VIRT_TYPE" || "$VIRT_TYPE" == "none" ]]; then
+    VIRT_TYPE=""
+  fi
+fi
+if [[ -z "$VIRT_TYPE" ]]; then
+  if grep -qi 'hypervisor' /proc/cpuinfo 2>/dev/null; then
+    VIRT_TYPE="hypervisor"
+  fi
+fi
+if [[ -z "$VIRT_TYPE" ]]; then
+  PRODUCT_NAME=$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)
+  SYS_VENDOR=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
+  DMI_HINT="${PRODUCT_NAME} ${SYS_VENDOR}"
+  if echo "$DMI_HINT" | grep -qiE 'kvm|qemu|vmware|virtualbox|xen|hyper-v|bhyve|openstack|amazon ec2|google compute|rhev|bochs|parallels|ovirt|aliyun|tencent|huawei|cloud|hvm'; then
+    VIRT_TYPE=$(echo "$DMI_HINT" | awk '{$1=$1; print}')
+  fi
+fi
+[[ -z "$VIRT_TYPE" ]] && VIRT_TYPE="none"
 SWAP_TOTAL=$(awk '/SwapTotal/ {print $2 * 1024; exit}' /proc/meminfo)
 SWAP_FREE=$(awk '/SwapFree/ {print $2 * 1024; exit}' /proc/meminfo)
 SWAP_TOTAL=${SWAP_TOTAL:-0}
@@ -2585,6 +2606,7 @@ NODE_LEVEL_JSON=$(cat <<EOF
   "load_avg_5min": $(json_number_or_null "$LOAD_5"),
   "load_avg_15min": $(json_number_or_null "$LOAD_15"),
   "cpu_flags": $(json_string "$CPU_FLAGS"),
+  "virtualization_type": $(json_string "$VIRT_TYPE"),
   "swap_total_bytes": $(json_number_or_null "$SWAP_TOTAL"),
   "swap_used_bytes": $(json_number_or_null "$SWAP_USED"),
   "fd_allocated": $(json_number_or_null "$FD_ALLOC"),

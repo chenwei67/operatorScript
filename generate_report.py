@@ -76,6 +76,13 @@ match = re.search(r'"cpu_flags"\s*:\s*"([^"]*)"', metrics_text)
 cpu_flags = match.group(1) if match else ""
 avx2_supported = "支持AVX2" if "avx2" in cpu_flags else "不支持AVX2"
 cpu_value = "{}（{}）".format(cpu_flags, avx2_supported) if cpu_flags else avx2_supported
+match = re.search(r'"virtualization_type"\s*:\s*"([^"]*)"', metrics_text)
+virt_type = match.group(1) if match else ""
+virt_type_lower = virt_type.lower()
+if not virt_type or virt_type_lower == "none":
+    virt_value = "否"
+else:
+    virt_value = "是（{}）".format(virt_type)
 
 k8s_nodes = read_csv(input_dir / "snapshots/cluster_k8s_nodes.csv")
 device_mapper_rows = []
@@ -834,8 +841,8 @@ flow.append(toc)
 flow.append(PageBreak())
 
 add_heading1("节点概要")
-add_heading("CPU指令集支持")
-add_table([["项目", "值"], ["CPU指令集", cpu_value]])
+add_heading("系统信息")
+add_table([["项目", "值"], ["CPU指令集", cpu_value], ["虚拟化环境", virt_value]])
 
 add_heading("K8S节点信息")
 add_table([
