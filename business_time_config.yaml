@@ -1,0 +1,314 @@
+business_time_columns:
+  - database: business
+    table: acl_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: alert_relation_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: arp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: asset_impersonation_security_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: asset_log
+    time_column: insertTime
+    time_type: datetime
+  - database: business
+    table: das_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: datalake_platform_log
+    time_column: insertTime
+    time_type: datetime
+  - database: business
+    table: datalake_report_log
+    time_column: insertTime
+    time_type: datetime
+  - database: business
+    table: db2_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: dce_rpc_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: dhcp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: dns_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: dsp_http_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: dynamic_graph_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: eml_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: endpoint_behavior_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: endpoint_security_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: endpoint_telemetry_security_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: file_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ftp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ftp_login_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: http_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: http_login_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: icmp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: imap_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: imap_login_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ioa_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+    query_time_column: occurTime
+  - database: business
+    table: iot_device_audit_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: kerberos_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ldap_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: mongo_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: mysql_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: nat_config_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: nat_session_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: netbios_nbns_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: netflow_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: network_security_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: nfs_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ntlm_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: onvif_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: operation_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: oracle_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: other_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: parse_status_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: pgsql_cmd_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: pgsql_login_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: pop3_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: pop3_login_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: raw_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: rdp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: redis_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: report_audit_log
+    time_column: insertTime
+    time_type: datetime
+  - database: business
+    table: sas_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: sdp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: sip_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: smb_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: smtp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: smtp_login_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: snmp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: socks_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: sql_server_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ssh_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ssl_tls_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: sybase_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: tcp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: telnet_command_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: telnet_login_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: telnet_option_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: udp_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: universal_thirdparty_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: vpn_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: vsphere_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: weak_log
+    time_column: insertTime
+    time_type: datetime
+  - database: business
+    table: webmail_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: webmail_login_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ztna_access_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ztna_user_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
+  - database: business
+    table: ztna_user_security_log
+    time_column: recordTimestamp
+    time_type: int64_unix_seconds
