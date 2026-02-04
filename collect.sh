@@ -324,9 +324,24 @@ if [[ -z "$CK_PASSWORD" ]]; then
       | base64_decode 2>/dev/null \
       | tr -d '\r' || true
   )
+  if [[ -z "$CK_PASSWORD" ]]; then
+    CK_ACCOUNT_JSON=$(
+      kubectl get secret -n xdr-comm-config root-account -ojsonpath='{.data.account}' 2>/dev/null \
+        | base64_decode 2>/dev/null \
+        | tr -d '\r' || true
+    )
+    if [[ -n "$CK_ACCOUNT_JSON" ]]; then
+      CK_ACCOUNT_USER=$(printf '%s' "$CK_ACCOUNT_JSON" | jq -r '.clickhouse_username // empty' 2>/dev/null || true)
+      CK_ACCOUNT_PASSWORD=$(printf '%s' "$CK_ACCOUNT_JSON" | jq -r '.clickhouse_password // empty' 2>/dev/null || true)
+      if [[ -n "$CK_ACCOUNT_USER" && -n "$CK_ACCOUNT_PASSWORD" ]]; then
+        CK_USER="$CK_ACCOUNT_USER"
+        CK_PASSWORD="$CK_ACCOUNT_PASSWORD"
+      fi
+    fi
+  fi
 fi
 if [[ -z "$CK_PASSWORD" ]]; then
-  >&2 echo "ERROR: missing ClickHouse password. Set --ck-password/CK_PASSWORD or ensure 'kubectl -n ${CK_K8S_NAMESPACE} get secret root -ojson | jq -r .data.root | base64 -d' works."
+  >&2 echo "ERROR: missing ClickHouse password. Set --ck-password/CK_PASSWORD or ensure 'kubectl -n ${CK_K8S_NAMESPACE} get secret root -ojson | jq -r .data.root | base64 -d' or 'kubectl -n xdr-comm-config get secret root-account -ojsonpath={.data.account} | base64 -d' works."
   exit 1
 fi
 
