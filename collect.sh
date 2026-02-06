@@ -771,7 +771,7 @@ CK_VERSION_VALUE=$("${CLICKHOUSE_CLIENT_BASE[@]}" --format TabSeparated --query 
 
 # 使用 kubectl 统计 K8s 节点数量
 log "Collecting node count via kubectl"
-CLUSTER_NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+CLUSTER_NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]' || true)
 if [[ -z "$CLUSTER_NODE_COUNT" ]]; then
   log "WARNING: kubectl get nodes failed; default node count to 0"
   CLUSTER_NODE_COUNT="0"
@@ -1987,7 +1987,7 @@ read -r LOAD_1 LOAD_5 LOAD_15 _ < /proc/loadavg 2>/dev/null || {
   LOAD_5=""
   LOAD_15=""
 }
-CPU_FLAGS=$(grep -ow 'avx2' /proc/cpuinfo 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,/, /g; s/^, //; s/, $//' )
+CPU_FLAGS=$(grep -ow 'avx2' /proc/cpuinfo 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,/, /g; s/^, //; s/, $//' || true)
 [[ -z "$CPU_FLAGS" ]] && CPU_FLAGS="none"
 VIRT_TYPE=""
 if command -v systemd-detect-virt >/dev/null 2>&1; then
@@ -2023,8 +2023,8 @@ read -r FD_ALLOC _ FD_MAX < /proc/sys/fs/file-nr 2>/dev/null || {
   FD_ALLOC=0
   FD_MAX=0
 }
-TCP_IN_USE=$(grep 'TCP:' /proc/net/sockstat 2>/dev/null | awk '{print $3}')
-TCP_TIME_WAIT=$(grep 'TCP:' /proc/net/sockstat 2>/dev/null | awk '{print $7}')
+TCP_IN_USE=$(grep 'TCP:' /proc/net/sockstat 2>/dev/null | awk '{print $3}' || true)
+TCP_TIME_WAIT=$(grep 'TCP:' /proc/net/sockstat 2>/dev/null | awk '{print $7}' || true)
 TCP_IN_USE=${TCP_IN_USE:-0}
 TCP_TIME_WAIT=${TCP_TIME_WAIT:-0}
 calc_percentage() {
@@ -2732,7 +2732,7 @@ validate_exported_files_have_data() {
     total_files=$((total_files + 1))
     local rel_path bytes
     rel_path="${file_path#"$root_dir"/}"
-    bytes=$(wc -c <"$file_path" | tr -d '[:space:]' || echo "0")
+    bytes=$(wc -c <"$file_path" 2>/dev/null | tr -d '[:space:]' || echo "0")
 
     if [[ ! -s "$file_path" ]]; then
       empty_files=$((empty_files + 1))
